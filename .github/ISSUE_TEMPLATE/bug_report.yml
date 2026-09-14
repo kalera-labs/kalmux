@@ -1,0 +1,26 @@
+name: Bug report
+description: Something in Kalmux does not work
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what you got.
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `kalmux doctor`
+      description: It checks every moving part; paste the whole thing. Redact anything you would rather not share.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      placeholder: macOS 15.5, iTerm2 3.7.0, tmux 3.6a, Python 3.13, Claude Code 2.1.270
+    validations:
+      required: true

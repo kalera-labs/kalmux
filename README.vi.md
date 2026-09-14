@@ -12,7 +12,9 @@
 <img alt="License" src="https://img.shields.io/badge/License-MIT-black">
 </p>
 
-<p align="center"><img src="assets/toolbelt.png" alt="Toolbelt Kalmux: mỗi session tmux một thẻ, có trạng thái, vạch context và màu nhận diện" width="420"></p>
+<p align="center"><img src="assets/toolbelt.gif" alt="Toolbelt Kalmux: một agent chuyển vàng và nhảy lên đầu danh sách, bấm một cái là qua đúng tab, mấy session đã chết vẫn còn đó để resume" width="420"></p>
+
+<p align="center"><sub>Một agent dừng lại hỏi, thẻ của nó chuyển vàng và nhảy lên đầu; bấm một cái là qua đúng tab. Quay từ mock server có sẵn trong repo.</sub></p>
 
 <p align="center"><a href="README.md">English</a></p>
 

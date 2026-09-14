@@ -12,7 +12,9 @@
 <img alt="License" src="https://img.shields.io/badge/License-MIT-black">
 </p>
 
-<p align="center"><img src="assets/toolbelt.png" alt="The Kalmux toolbelt: one card per tmux session with state, context gauge and identity color" width="420"></p>
+<p align="center"><img src="assets/toolbelt.gif" alt="The Kalmux toolbelt: an agent turns amber and jumps to the top of the list, one click goes to its tab, and the sessions that died are still there to resume" width="420"></p>
+
+<p align="center"><sub>An agent stops for you, its card turns amber and jumps to the top; one click and you are in that tab. Recorded from the bundled mock server.</sub></p>
 
 <p align="center"><a href="README.vi.md">Tiếng Việt</a></p>
 

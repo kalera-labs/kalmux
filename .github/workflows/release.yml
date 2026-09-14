@@ -1,0 +1,92 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The existing tag to release
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: astral-sh/setup-uv@v5
+      - run: uv build
+      - id: meta
+        run: echo "version=$(ls dist/*.tar.gz | sed -E 's/.*kalmux-(.*)\.tar\.gz/\1/')" >> "$GITHUB_OUTPUT"
+      - name: The tag and the version in pyproject must agree
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          test "${tag#v}" = "${{ steps.meta.outputs.version }}" || {
+            echo "tag $tag does not match version ${{ steps.meta.outputs.version }}"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  github-release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          gh release view "$tag" >/dev/null 2>&1 \
+            && gh release upload "$tag" dist/* --clobber \
+            || gh release create "$tag" dist/* --title "Kalmux ${tag#v}" --generate-notes
+
+  pypi:
+    # Publishing needs a Trusted Publisher on pypi.org for kalera-labs/kalmux, workflow release.yml,
+    # environment pypi. Until that exists this job fails and the GitHub release still stands.
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  homebrew:
+    # Optional: set the repository secret TAP_GITHUB_TOKEN (a PAT that can write to
+    # kalera-labs/homebrew-tap) and every tag refreshes the formula by itself.
+    needs: [build, github-release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Point the tap at the new tag
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          if [ -z "$TAP_TOKEN" ]; then echo "no TAP_GITHUB_TOKEN; skipping the tap bump"; exit 0; fi
+          tag="${{ inputs.tag || github.ref_name }}"
+          version="${tag#v}"
+          url="https://github.com/${{ github.repository }}/archive/refs/tags/${tag}.tar.gz"
+          sha=$(curl -fsSL "$url" | shasum -a 256 | cut -d' ' -f1)
+          git clone --depth 1 "https://x-access-token:${TAP_TOKEN}@github.com/kalera-labs/homebrew-tap.git" tap
+          cd tap
+          sed -i -E "s|url \".*\"|url \"${url}\"|; s|sha256 \".*\"|sha256 \"${sha}\"|; s|version \".*\"|version \"${version}\"|" Formula/kalmux.rb
+          git config user.name "Kalera"
+          git config user.email "170533892+kalera-labs@users.noreply.github.com"
+          git commit -am "kalmux ${version}" && git push

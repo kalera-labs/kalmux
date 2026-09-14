@@ -1,0 +1,64 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # Kalmux drives iTerm2 and macOS `defaults`, and its hook is written for the bash 3.2 that ships
+    # with macOS, so the suite only means anything on a macOS runner.
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Tools the hook shells out to
+        run: jq --version; tmux -V || echo "no tmux on the runner (the suite brings its own fake)"; bash --version | head -1
+      - name: Tests
+        run: uv run --no-project --python ${{ matrix.python }} --with pytest --with pytest-cov python -m pytest -q --cov=src/kalmux --cov-report=term-missing
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uvx ruff check .
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv build
+      - name: The wheel must carry the assets, with the hook still executable
+        run: |
+          uv run --no-project --with twine python -m twine check dist/*
+          python3 - <<'PY'
+          import glob, zipfile
+          wheel = glob.glob("dist/*.whl")[0]
+          names = {i.filename: (i.external_attr >> 16) & 0o777 for i in zipfile.ZipFile(wheel).infolist()}
+          for want in ("kalmux/assets/cc-status-tmux", "kalmux/assets/index.html", "kalmux/assets/it2_toolbelt.py"):
+              assert want in names, f"{want} missing from {wheel}"
+          mode = names["kalmux/assets/cc-status-tmux"]
+          assert mode & 0o111, f"the hook is not executable in the wheel ({mode:o})"
+          print("wheel ok:", wheel)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/

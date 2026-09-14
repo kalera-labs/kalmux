@@ -338,7 +338,31 @@ def act_forget(b):
     return 200, True, f"Forgot {t['session_id']}", {}
 
 
+def act_mock(body):
+    """Development only: patch a session in place so a demo (or a recording) can show state changing.
+
+        curl -XPOST -H "X-TM-Token: $TOKEN" localhost:47399/api/_mock \
+             -d '{"name": "api", "patch": {"state": "waiting", "detail": "Allow Bash(pytest -q)?"}}'
+    """
+    sess = find(body.get("name"))
+    if not sess:
+        return 400, False, "No such session", {}
+    patch = body.get("patch") or {}
+    if not isinstance(patch, dict):
+        return 400, False, "patch must be an object", {}
+    sess.update(patch)
+    for key in ("state", "detail", "title", "since"):
+        if key in patch and sess.get("panes"):
+            sess["panes"][0][key] = patch[key]
+    if "since" not in patch and "state" in patch:
+        sess["since"] = _now()
+        if sess.get("panes"):
+            sess["panes"][0]["since"] = sess["since"]
+    return 200, True, f"Patched {sess['name']}", {}
+
+
 ROUTES = {
+    "/api/_mock": act_mock,
     "/api/go": act_go, "/api/open": act_open, "/api/color": act_color,
     "/api/new": act_new, "/api/kill": act_kill, "/api/rename": act_rename,
     "/api/detach": act_detach, "/api/next-waiting": act_next_waiting,
