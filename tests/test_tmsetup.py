@@ -590,13 +590,12 @@ def test_cli_path_prefers_the_name_it_was_invoked_as(tmp_path, monkeypatch):
     monkeypatch.setattr(tmsetup.sys, "argv", [str(stable), "setup"])
     assert tmsetup.cli_path() == stable
 
-    # a symlink is followed, so a clone gets the file in the checkout rather than ~/.local/bin
-    link = tmp_path / "link-kalmux"
-    real = tmp_path / "bin" / "kalmux"
-    (tmp_path / "kalmux").symlink_to(real)
-    monkeypatch.setattr(tmsetup.sys, "argv", [str(tmp_path / "kalmux")])
-    assert tmsetup.cli_path() == real.resolve()
-    assert not link.exists()
+    # a symlink is NOT followed either: Homebrew links bin/kalmux into a Cellar path that an upgrade
+    # replaces, and setup_steps refuses to relink a path that already resolves to the same file.
+    link = tmp_path / "kalmux"
+    link.symlink_to(stable)
+    monkeypatch.setattr(tmsetup.sys, "argv", [str(link)])
+    assert tmsetup.cli_path() == link
 
     # invoked as anything else (pytest, python -c), it falls back to the checkout
     monkeypatch.setattr(tmsetup.sys, "argv", ["/usr/bin/pytest"])

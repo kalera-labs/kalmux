@@ -123,10 +123,9 @@ def cli_path() -> Path:
     while the name on PATH survives; baking the versioned one into ~/.tmux.conf and the AutoLaunch script
     would leave both dangling after the next upgrade.
     """
-    argv0 = Path(sys.argv[0]) if sys.argv and sys.argv[0] else None
+    argv0 = Path(sys.argv[0]).absolute() if sys.argv and sys.argv[0] else None
     if argv0 is not None and argv0.name in tmstatusline.WRAPPER_NAMES and argv0.is_file():
-        # a symlink is resolved (~/.local/bin/kalmux -> the checkout); a real script is kept as it is
-        return argv0.resolve() if argv0.is_symlink() else argv0.absolute()
+        return argv0                                 # kept unresolved on purpose: see the docstring
     if SOURCE_CHECKOUT:
         return SOURCE_CHECKOUT / "bin" / "kalmux"
     # the script installed next to THIS interpreter, before anything a stale PATH may still point at.
@@ -162,22 +161,24 @@ def link_is_ours(link: Path) -> bool:
 
 
 def is_the_command(link: Path) -> bool:
-    """True when `link` IS the kalmux executable (the console script of an installed package), rather than a
-    symlink pointing at it. A symlink of ours resolves to the same file, so resolve() alone cannot tell them apart."""
-    return not link.is_symlink() and link.exists() and _same_path(CLI, link)
+    """True when `link` already gets you the kalmux we are running: the installed console script itself, or
+    a symlink of ours that resolves to the same file. Linking such a path to itself would destroy it."""
+    return (link.exists() or link.is_symlink()) and _same_path(CLI, link)
 
 
 def symlink_cli(link: Path = DEFAULT_TM_LINK) -> str:
     """Put `kalmux` on PATH. An installed package already did: when the command IS that path, leave it
     alone instead of moving the real executable aside and replacing it with a symlink to itself."""
     if is_the_command(link):
-        return f"{link} is the installed kalmux command; left alone"
+        return f"{link} already is the kalmux command; left alone"
     return symlink(CLI, link)
 
 
 def alias_symlink(target: Path, link: Path) -> bool:
     """Create a legacy-name alias (`kmux`, `tm`) only when the path is free or already ours: an unrelated
     program of the same name is never clobbered."""
+    if _same_path(target, link):
+        return True                                  # already gets you this kalmux; relinking it to itself would not
     if (link.exists() or link.is_symlink()) and not link_is_ours(link):
         return False
     symlink(target, link)
@@ -416,7 +417,7 @@ def setup_steps(ui: bool = True, tm_link: Path = DEFAULT_TM_LINK, hook_link: Pat
         ("kalmux symlink", lambda: symlink_cli(tm_link)),
     ]
     steps += [(f"{link.name} alias symlink (skipped if the path is not ours)",
-               lambda link=link: alias_symlink(CLI, link)) for link in LEGACY_LINKS if not is_the_command(link)]
+               lambda link=link: alias_symlink(CLI, link)) for link in LEGACY_LINKS]
     steps += [
         ("iTerm2 prefs", write_iterm_prefs),
         ("tmux.conf block", lambda: write_tmux_conf(DEFAULT_TMUX_CONF, tm_link)),
@@ -492,11 +493,10 @@ def doctor_checks(settings_path: Path = DEFAULT_SETTINGS, hook_link: Path = DEFA
     add("kalmux config file", not config_errors, "; ".join(config_errors) or str(tmconfig.config_path()))
 
     # the rename moved bin/kmux to bin/kalmux: a pre-rename ~/.local/bin/kmux symlink dangles until setup runs
-    add("kalmux on PATH", is_the_command(cli_link) or (cli_link.is_symlink() and cli_link.resolve() == CLI.resolve()),
-        (f"{cli_link} is the installed command" if is_the_command(cli_link) else link_info(cli_link)) + " (kalmux setup)")
+    add("kalmux on PATH", is_the_command(cli_link),
+        (str(cli_link) if not cli_link.is_symlink() else link_info(cli_link)) + " (kalmux setup)")
     for alias_link in alias_links:
-        add(f"{alias_link.name} alias", is_the_command(alias_link) or
-            (alias_link.is_symlink() and alias_link.resolve() == CLI.resolve()), link_info(alias_link))
+        add(f"{alias_link.name} alias", is_the_command(alias_link), link_info(alias_link))
 
     try:
         link_ok = hook_link.is_symlink() and hook_link.resolve() == wrapper.resolve()

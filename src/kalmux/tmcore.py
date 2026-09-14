@@ -18,7 +18,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-VERSION = "0.4.2"
+VERSION = "0.4.3"
 # 20 identity colors in spectrum order (the UI shows them in this order); "grey" is an alias of "gray"
 # that the UI filters out. Every value of the first nine is the one Kalmux shipped with: changing a hex would
 # silently repaint sessions that already carry it in @tm_color.
