@@ -55,9 +55,11 @@ jobs:
             || gh release create "$tag" dist/* --title "Kalmux ${tag#v}" --generate-notes
 
   pypi:
-    # Publishing needs a Trusted Publisher on pypi.org for kalera-labs/kalmux, workflow release.yml,
-    # environment pypi. Until that exists this job fails and the GitHub release still stands.
+    # Needs a Trusted Publisher on pypi.org (project kalmux, owner kalera-labs, workflow release.yml,
+    # environment pypi) and the repository variable PYPI_PUBLISH set to "true". Until then this job is
+    # skipped rather than failed, so the GitHub release is still green.
     needs: build
+    if: vars.PYPI_PUBLISH == 'true'
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
