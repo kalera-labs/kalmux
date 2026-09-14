@@ -578,3 +578,26 @@ def test_autolaunch_state_recognises_a_script_baked_before_the_rename(tmp_path, 
     monkeypatch.setattr(tmsetup, "_run", lambda cmd, **kw: (0, 'display dialog "not ours"'))
     stamp.write_text("stale")
     assert tmsetup.autolaunch_state(script, stamp) == "foreign"
+
+
+# ---------- which file the `kalmux` command is, in each way it can be installed ----------
+def test_cli_path_prefers_the_name_it_was_invoked_as(tmp_path, monkeypatch):
+    """A Homebrew keg lives under a versioned Cellar path that `brew upgrade` replaces; the name on PATH
+    does not move. Baking the versioned one into ~/.tmux.conf and AutoLaunch would dangle after an upgrade."""
+    stable = tmp_path / "bin" / "kalmux"
+    stable.parent.mkdir()
+    stable.write_text("#!/usr/bin/env python3\n")
+    monkeypatch.setattr(tmsetup.sys, "argv", [str(stable), "setup"])
+    assert tmsetup.cli_path() == stable
+
+    # a symlink is followed, so a clone gets the file in the checkout rather than ~/.local/bin
+    link = tmp_path / "link-kalmux"
+    real = tmp_path / "bin" / "kalmux"
+    (tmp_path / "kalmux").symlink_to(real)
+    monkeypatch.setattr(tmsetup.sys, "argv", [str(tmp_path / "kalmux")])
+    assert tmsetup.cli_path() == real.resolve()
+    assert not link.exists()
+
+    # invoked as anything else (pytest, python -c), it falls back to the checkout
+    monkeypatch.setattr(tmsetup.sys, "argv", ["/usr/bin/pytest"])
+    assert tmsetup.cli_path() == tmsetup.SOURCE_CHECKOUT / "bin" / "kalmux"

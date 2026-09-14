@@ -116,13 +116,19 @@ def defaults_read(key: str) -> str:
 
 
 def cli_path() -> Path:
-    """The file the `kalmux` command is. In a git clone that is bin/kalmux; from an installed package it is
-    the console script uv / pipx / Homebrew wrote (also a Python file, so start_server can run it directly)."""
+    """The file the `kalmux` command is: a Python script something else can run as `python3 <path> ...`.
+
+    The command we were actually invoked as comes first, because it is the path that stays valid. A
+    Homebrew keg, for instance, lives under a versioned Cellar directory that `brew upgrade` replaces,
+    while the name on PATH survives; baking the versioned one into ~/.tmux.conf and the AutoLaunch script
+    would leave both dangling after the next upgrade.
+    """
+    argv0 = Path(sys.argv[0]) if sys.argv and sys.argv[0] else None
+    if argv0 is not None and argv0.name in tmstatusline.WRAPPER_NAMES and argv0.is_file():
+        # a symlink is resolved (~/.local/bin/kalmux -> the checkout); a real script is kept as it is
+        return argv0.resolve() if argv0.is_symlink() else argv0.absolute()
     if SOURCE_CHECKOUT:
         return SOURCE_CHECKOUT / "bin" / "kalmux"
-    argv0 = Path(sys.argv[0]).resolve() if sys.argv and sys.argv[0] else None
-    if argv0 is not None and argv0.is_file() and argv0.name in tmstatusline.WRAPPER_NAMES:
-        return argv0
     # the script installed next to THIS interpreter, before anything a stale PATH may still point at.
     # sys.executable is NOT resolved first: in a venv that would follow the python symlink out of the venv.
     here = Path(sys.executable).parent / "kalmux"
