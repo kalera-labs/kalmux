@@ -1,11 +1,11 @@
-"""End-to-end tests for bin/cc-status-tmux (the hook wrapper)."""
+"""End-to-end tests for the cc-status-tmux hook wrapper."""
 import base64
 import json
 import subprocess
 
-from conftest import BIN
+from conftest import ASSETS
 
-WRAPPER = BIN / "cc-status-tmux"
+WRAPPER = ASSETS / "cc-status-tmux"
 ESC = "\x1b"
 BEL = "\x07"
 
@@ -15,7 +15,7 @@ def run_hook(fake_env, payload, extra_env=None, raw=None):
     if extra_env:
         env.update(extra_env)
     data = raw if raw is not None else json.dumps(payload)
-    return subprocess.run([str(WRAPPER)], input=data, text=True, env=env, capture_output=True, timeout=20)
+    return subprocess.run([str(WRAPPER)], input=data, text=True, env=env, capture_output=True, timeout=20, check=False)
 
 
 def tmux_log(fake_env):
@@ -96,13 +96,13 @@ def test_ask_user_question_is_waiting_with_question(fake_env):
 
 
 def test_stop_sanitizes_and_truncates_last_message(fake_env):
-    msg = "Xong rồi pa " + ESC + "]0;evil" + BEL + " line2\nline3 " + "x" * 300
+    msg = "Đã xong — 3 tệp " + ESC + "]0;evil" + BEL + " line2\nline3 " + "x" * 300
     run_hook(fake_env, {"hook_event_name": "Stop", "last_assistant_message": msg})
     log = tmux_log(fake_env)
     assert "@cc_state idle" in log
-    detail_line = [line for line in log.splitlines() if "@cc_detail" in line][0]
+    detail_line = next(line for line in log.splitlines() if "@cc_detail" in line)
     detail = detail_line.split("@cc_detail ", 1)[1]
-    assert detail.startswith("✓ Xong rồi pa")
+    assert detail.startswith("✓ Đã xong — 3 tệp")
     assert ESC not in detail and BEL not in detail and "\n" not in detail
     assert len(detail) <= 122  # "✓ " + 120
     out = tty_bytes(fake_env)
@@ -222,7 +222,7 @@ def test_single_tmux_display_roundtrip(fake_env):
 def test_stop_truncation_is_utf8_safe_even_with_c_locale(fake_env):
     msg = "ă" * 200
     run_hook(fake_env, {"hook_event_name": "Stop", "last_assistant_message": msg}, extra_env={"LC_ALL": "C"})
-    detail = [line for line in tmux_log(fake_env).splitlines() if "@cc_detail" in line][0].split("@cc_detail ", 1)[1]
+    detail = next(line for line in tmux_log(fake_env).splitlines() if "@cc_detail" in line).split("@cc_detail ", 1)[1]
     assert detail == "✓ " + "ă" * 120
 
 

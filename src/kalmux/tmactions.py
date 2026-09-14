@@ -14,10 +14,27 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from tmconfig import SESSION_ID_RE, render_resume
-from tmcore import (CLEAR_WORDS, CTRL_RE, HEX_RE, STATE_ORDER, It2, Tmux, alive_session_ids, attach_command,
-                    cc_tab_command, load_registry, load_status, load_trails, merge, osc6_tab_color, parse_color,
-                    tombstones, valid_session_name, write_tty)
+from .tmconfig import SESSION_ID_RE, render_resume
+from .tmcore import (
+    CLEAR_WORDS,
+    CTRL_RE,
+    HEX_RE,
+    STATE_ORDER,
+    It2,
+    Tmux,
+    alive_session_ids,
+    attach_command,
+    cc_tab_command,
+    load_registry,
+    load_status,
+    load_trails,
+    merge,
+    osc6_tab_color,
+    parse_color,
+    tombstones,
+    valid_session_name,
+    write_tty,
+)
 
 # same colors as bin/cc-status-tmux (and iTerm2's own cc-status)
 STATUS_COLORS = {"working": ("#ff9500", "#ff9500"), "waiting": ("#5f87ff", "#5f87ff"), "idle": ("#00d75f", "#888888")}
@@ -168,7 +185,7 @@ def snapshot(tmux: Tmux, registry_dir: Path, tabmap: TabMap | None, now: int | N
         s["panes"].append(pane)
     out = [_session_entry(s) for s in sessions.values()]
     out.sort(key=lambda s: (STATE_ORDER.get(s["state"], 9), s["name"]))
-    counts = {k: 0 for k in ("waiting", "working", "idle", "busy", "unknown", "stale", "gone")}
+    counts = dict.fromkeys(("waiting", "working", "idle", "busy", "unknown", "stale", "gone"), 0)
     for s in out:
         if s["state"] in counts:
             counts[s["state"]] += 1

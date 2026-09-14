@@ -25,7 +25,7 @@ def parse_args(argv=None):
 def main(argv=None) -> int:
     args = parse_args(argv)
     try:
-        import iterm2  # noqa: WPS433 (optional dependency, installed by uv on demand)
+        import iterm2
     except ImportError:
         print("it2_toolbelt: the `iterm2` package is missing (run via: uv run --no-project --with iterm2 python ...)", file=sys.stderr)
         return 2
@@ -47,7 +47,7 @@ def main(argv=None) -> int:
 
     try:
         iterm2.run_until_complete(run)
-    except Exception as exc:  # connection refused, auth denied, ...
+    except Exception as exc:  # noqa: BLE001 - connection refused, auth denied, iTerm2 not running, ...
         print(f"it2_toolbelt: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
     return 0

@@ -4,9 +4,10 @@ import json
 import os
 
 import pytest
-import tmactions as ta
-import tmconfig
+
 from fakes import FakeIt2, FakeTmux, it2_row, pane, write_status, write_trail
+from kalmux import tmactions as ta
+from kalmux import tmconfig
 
 
 # ---------- TabMap ----------
@@ -95,10 +96,10 @@ def test_session_with_a_dead_claude_is_gone_not_busy(tmp_path):
     (tmp_path / "reg").mkdir()
     (tmp_path / "reg" / "1.json").write_text('{"pid": 1, "sessionId": "s", "tmux": "dead:@1.%1", "status": "busy"}')
     tmux = FakeTmux(panes=[pane("dead", pane_id="%1", cmd="make"), pane("dead", pane_id="%2", window_id="@2", cmd="python3")])
-    import tmcore
+    from kalmux import tmcore
     snap = ta.snapshot(tmux, tmp_path / "reg", None, now=100) if tmcore.pid_alive(1) is False else None
     if snap is None:      # pid 1 answers kill -0 on this platform: force the dead branch through load_registry's hook
-        import tmactions
+        from kalmux import tmactions
         real = tmactions.load_registry
         try:
             tmactions.load_registry = lambda d: real(d, alive=lambda pid: False)

@@ -6,9 +6,9 @@ import threading
 import time
 
 import pytest
-import tmconfig
-import tmserver
+
 from fakes import FakeIt2, FakeTmux, it2_row, pane, write_trail
+from kalmux import tmconfig, tmserver
 
 TEMPLATE = ('<!doctype html><html><head><meta name="tm-token" content="__TM_TOKEN__">'
             '<meta name="tm-palette" content="__TM_PALETTE__"><style nonce="__TM_NONCE__">body{}</style></head>'

@@ -53,10 +53,19 @@ Three small pieces do the work: a hook wrapper, the `kalmux` CLI, and a web UI s
 Requires macOS with iTerm2 3.7+, tmux 3.x, Python 3.11+, `jq`, and `uv` for the toolbelt registration.
 
 ```bash
-git clone https://github.com/3d-era/kalmux.git
+brew install kalera-labs/tap/kalmux
+kalmux setup
+```
+
+Or from a clone, which is also how you hack on it:
+
+```bash
+git clone https://github.com/kalera-labs/kalmux.git
 cd kalmux
 bin/kalmux setup
 ```
+
+Either way `kalmux` ends up on your PATH: Homebrew puts the command there itself, and from a clone `setup` links `~/.local/bin/kalmux` to `bin/kalmux`.
 
 `setup` is idempotent and reversible. It creates `~/.config/kalmux/config.toml`, links the hook and the CLI, sets two iTerm2 preferences, adds a managed block to `~/.tmux.conf`, installs an iTerm2 AutoLaunch script that starts the UI server, routes Claude Code's status line through Kalmux, registers the toolbelt tool, and finishes by running `kalmux doctor`.
 
@@ -66,7 +75,7 @@ Then open the toolbelt: **View > Toolbelt** (⇧⌘B) and pick **Kalmux**. Reatt
 <summary>What setup touches, and why</summary>
 
 - `~/.config/iterm2/cc-status` → symlink to the hook wrapper. This is the path iTerm2 writes into `~/.claude/settings.json`. Reinstalling iTerm2's Claude Code integration can undo it; `kalmux doctor` notices and `kalmux setup` puts it back.
-- `~/.local/bin/kalmux` → the CLI. `kmux` and `tm` stay as aliases to the same file, so older muscle memory and scripts keep working.
+- `~/.local/bin/kalmux` → the CLI, when you run from a clone. `kmux` and `tm` stay as aliases to the same file, so older muscle memory and scripts keep working. An installed package already owns the name, so `setup` leaves it alone.
 - iTerm2 preferences `OpenTmuxWindowsIn=2` (tmux windows open as tabs in the attaching window) and `AutoHideTmuxClientSession=true`.
 - A managed block in `~/.tmux.conf`: `allow-passthrough on`, a status line that shows `[working]` / `[waiting]` per window, and a `client-attached` hook that replays state and color into a fresh tab.
 - `~/Library/Application Support/iTerm2/Scripts/AutoLaunch.scpt`, which starts the UI server whenever iTerm2 launches. An AutoLaunch script you wrote yourself is never overwritten. The generated script bakes in an absolute interpreter path and a `PATH` prefix, because iTerm2 launches under the login `PATH` where neither a modern `python3` nor Homebrew's `tmux` is visible, and a server that cannot find `tmux` shows an empty toolbelt after every reboot.
@@ -159,12 +168,13 @@ After changing Kalmux's own code, run `kalmux ui restart` from a shell inside iT
 ## Development
 
 ```bash
-uv run --no-project --with pytest --with pytest-cov python -m pytest -q --cov=bin --cov=lib --cov-report=term-missing
+uv run --no-project --with pytest --with pytest-cov python -m pytest -q --cov=src/kalmux --cov-report=term-missing
+uvx ruff check .
 python3 scripts/dev/mock_server.py 47399    # the UI with fake data at http://127.0.0.1:47399/
 kalmux ui restart                           # after changing server code, from a shell inside iTerm2
 ```
 
-Python standard library only, no runtime dependencies. `lib/` holds the modules, `bin/` the two executables, `ui/index.html` the whole front end in one vanilla-JS file.
+Python standard library only, no runtime dependencies. `src/kalmux/` holds the modules, `src/kalmux/assets/` the hook wrapper and the single-file front end, `bin/kalmux` runs the whole thing straight from a clone.
 
 ## License
 

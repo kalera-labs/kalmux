@@ -5,7 +5,7 @@ import json
 import os
 import pathlib
 
-from tmcore import FIELDS, SEP
+from kalmux.tmcore import FIELDS, SEP
 
 
 def pane(session, pane_id="%1", window_id="@1", state="", detail="", since="", title="✳ x", path="/Volumes/Dev/proj",

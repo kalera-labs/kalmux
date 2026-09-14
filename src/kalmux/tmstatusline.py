@@ -22,7 +22,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from tmconfig import SESSION_ID_RE, load_config
+from .tmconfig import SESSION_ID_RE, load_config
 
 MAX_STDIN = 1 << 20                 # 1 MiB: the payload is a few KiB; anything bigger is not ours to relay
 FRESH_SECONDS = 600                 # a status file older than this belongs to a session that stopped refreshing

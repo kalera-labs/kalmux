@@ -20,13 +20,11 @@ import sys
 import time
 from pathlib import Path
 
-import tmconfig
-import tmstatusline
-from tmcore import ROOT, VERSION, _decode, resolve_tmux
+from . import tmconfig, tmstatusline
+from .tmcore import ASSETS, ROOT, SOURCE_CHECKOUT, VERSION, _decode, resolve_tmux
 
-WRAPPER = ROOT / "bin" / "cc-status-tmux"
-CLI = ROOT / "bin" / "kalmux"
-TOOLBELT_SCRIPT = ROOT / "scripts" / "it2_toolbelt.py"
+WRAPPER = ASSETS / "cc-status-tmux"
+TOOLBELT_SCRIPT = ASSETS / "it2_toolbelt.py"
 DEFAULT_HOOK_LINK = Path.home() / ".config/iterm2/cc-status"
 DEFAULT_TM_LINK = Path.home() / ".local/bin/kalmux"
 # kept so anything that already types `kmux` or `tm` keeps working (both are plain aliases of bin/kalmux)
@@ -117,6 +115,26 @@ def defaults_read(key: str) -> str:
     return _run(["defaults", "read", ITERM_DOMAIN, key], timeout=10)[1] if sys.platform == "darwin" else ""
 
 
+def cli_path() -> Path:
+    """The file the `kalmux` command is. In a git clone that is bin/kalmux; from an installed package it is
+    the console script uv / pipx / Homebrew wrote (also a Python file, so start_server can run it directly)."""
+    if SOURCE_CHECKOUT:
+        return SOURCE_CHECKOUT / "bin" / "kalmux"
+    argv0 = Path(sys.argv[0]).resolve() if sys.argv and sys.argv[0] else None
+    if argv0 is not None and argv0.is_file() and argv0.name in tmstatusline.WRAPPER_NAMES:
+        return argv0
+    # the script installed next to THIS interpreter, before anything a stale PATH may still point at.
+    # sys.executable is NOT resolved first: in a venv that would follow the python symlink out of the venv.
+    here = Path(sys.executable).parent / "kalmux"
+    if here.is_file():
+        return here
+    found = shutil.which("kalmux")
+    return Path(found).resolve() if found else here
+
+
+CLI = cli_path()
+
+
 def symlink(target: Path, link: Path) -> str:
     """Point `link` at `target`. A REAL file already there is the user's: move it aside, never delete it."""
     link.parent.mkdir(parents=True, exist_ok=True)
@@ -132,8 +150,23 @@ def symlink(target: Path, link: Path) -> str:
 
 
 def link_is_ours(link: Path) -> bool:
-    """A symlink whose text points into this checkout (also true for the dangling pre-rename bin/tm link)."""
-    return link.is_symlink() and os.readlink(link).startswith(str(ROOT))
+    """A symlink of ours: it points into this checkout (true for the dangling pre-rename bin/tm link too) or
+    straight at the installed `kalmux` command."""
+    return link.is_symlink() and (os.readlink(link).startswith(str(ROOT)) or os.readlink(link) == str(CLI))
+
+
+def is_the_command(link: Path) -> bool:
+    """True when `link` IS the kalmux executable (the console script of an installed package), rather than a
+    symlink pointing at it. A symlink of ours resolves to the same file, so resolve() alone cannot tell them apart."""
+    return not link.is_symlink() and link.exists() and _same_path(CLI, link)
+
+
+def symlink_cli(link: Path = DEFAULT_TM_LINK) -> str:
+    """Put `kalmux` on PATH. An installed package already did: when the command IS that path, leave it
+    alone instead of moving the real executable aside and replacing it with a symlink to itself."""
+    if is_the_command(link):
+        return f"{link} is the installed kalmux command; left alone"
+    return symlink(CLI, link)
 
 
 def alias_symlink(target: Path, link: Path) -> bool:
@@ -206,7 +239,7 @@ def start_server(tm_path: Path = DEFAULT_TM_LINK, port: int = UI_PORT, wait: flo
     """Start `tm ui serve` detached from this process (it must be a descendant of iTerm2, see module doc)."""
     # imported here, not at module level: `kalmux statusline` imports tmsetup for state_dir() on every status-line
     # refresh, and tmserver drags in http.client/ssl/email — ~17 ms this path must not pay for.
-    from tmserver import health
+    from .tmserver import health
     if health(port):
         return True
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -282,7 +315,7 @@ def autolaunch_state(script: Path = AUTOLAUNCH, stamp: Path = AUTOLAUNCH_STAMP) 
 def install_autolaunch(tm_path: Path = DEFAULT_TM_LINK, script: Path = AUTOLAUNCH, stamp: Path = AUTOLAUNCH_STAMP,
                        python: str = "") -> None:
     python = python or sys.executable
-    if sys.version_info < (3, 11):
+    if sys.version_info < (3, 11):  # noqa: UP036 - a git clone can still be run by an old `python3` (see the docstring)
         raise OSError(f"refusing to bake {python} (Python {sys.version.split()[0]}) into AutoLaunch: "
                       "kalmux needs >=3.11; run `kalmux setup` from a shell whose `python3` is modern (e.g. Homebrew's)")
     source = autolaunch_source(tm_path, python)
@@ -374,10 +407,10 @@ def setup_steps(ui: bool = True, tm_link: Path = DEFAULT_TM_LINK, hook_link: Pat
         (STATE_DIR_STEP, migrate_state_dir),
         ("config file", tmconfig.ensure_config),
         ("hook symlink", lambda: symlink(WRAPPER, hook_link)),
-        ("kalmux symlink", lambda: symlink(CLI, tm_link)),
+        ("kalmux symlink", lambda: symlink_cli(tm_link)),
     ]
     steps += [(f"{link.name} alias symlink (skipped if the path is not ours)",
-               lambda link=link: alias_symlink(CLI, link)) for link in LEGACY_LINKS]
+               lambda link=link: alias_symlink(CLI, link)) for link in LEGACY_LINKS if not is_the_command(link)]
     steps += [
         ("iTerm2 prefs", write_iterm_prefs),
         ("tmux.conf block", lambda: write_tmux_conf(DEFAULT_TMUX_CONF, tm_link)),
@@ -453,11 +486,11 @@ def doctor_checks(settings_path: Path = DEFAULT_SETTINGS, hook_link: Path = DEFA
     add("kalmux config file", not config_errors, "; ".join(config_errors) or str(tmconfig.config_path()))
 
     # the rename moved bin/kmux to bin/kalmux: a pre-rename ~/.local/bin/kmux symlink dangles until setup runs
-    add("kalmux symlink -> bin/kalmux", cli_link.is_symlink() and cli_link.resolve() == CLI.resolve(),
-        link_info(cli_link) + " (kalmux setup)")
+    add("kalmux on PATH", is_the_command(cli_link) or (cli_link.is_symlink() and cli_link.resolve() == CLI.resolve()),
+        (f"{cli_link} is the installed command" if is_the_command(cli_link) else link_info(cli_link)) + " (kalmux setup)")
     for alias_link in alias_links:
-        add(f"{alias_link.name} alias -> bin/kalmux",
-            alias_link.is_symlink() and alias_link.resolve() == CLI.resolve(), link_info(alias_link))
+        add(f"{alias_link.name} alias", is_the_command(alias_link) or
+            (alias_link.is_symlink() and alias_link.resolve() == CLI.resolve()), link_info(alias_link))
 
     try:
         link_ok = hook_link.is_symlink() and hook_link.resolve() == wrapper.resolve()

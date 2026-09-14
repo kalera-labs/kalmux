@@ -7,6 +7,8 @@ htmlcov/
 .venv/
 *.pyc
 .playwright-mcp/
+.ruff_cache/
+dist/
 
 # local-only: agent rules and internal design notes (they name real projects and machines)
 CLAUDE.md

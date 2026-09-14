@@ -1,6 +1,7 @@
 """Unit tests for lib/tmconfig.py."""
 import pytest
-import tmconfig
+
+from kalmux import tmconfig
 
 
 def test_config_path_precedence(tmp_path):

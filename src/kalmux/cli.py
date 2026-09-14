@@ -16,14 +16,53 @@ import time
 from pathlib import Path
 
 from . import tmconfig, tmsetup, tmstatusline
-from .tmactions import (TabMap, action_color, action_detach, action_forget, action_go, action_kill, action_new,
-                        action_open, action_rename, action_resume, find_trail, reapply, resolve_session, trails_named)
+from .tmactions import (
+    TabMap,
+    action_color,
+    action_detach,
+    action_forget,
+    action_go,
+    action_kill,
+    action_new,
+    action_open,
+    action_rename,
+    action_resume,
+    find_trail,
+    reapply,
+    resolve_session,
+    trails_named,
+)
 from .tmconfig import load_config
-from .tmcore import (DEFAULT_REGISTRY, It2, Tmux, attach_command, fmt_age, load_registry, load_status,
-                     load_trails, merge, render_table, resumable_trails, sort_rows, tombstones)
+from .tmcore import (
+    DEFAULT_REGISTRY,
+    VERSION,
+    It2,
+    Tmux,
+    attach_command,
+    fmt_age,
+    load_registry,
+    load_status,
+    load_trails,
+    merge,
+    render_table,
+    resumable_trails,
+    sort_rows,
+    tombstones,
+)
 from .tmserver import health, serve
-from .tmsetup import (DEFAULT_HOOK_LINK, DEFAULT_SETTINGS, DEFAULT_TM_LINK, DEFAULT_TMUX_CONF, STATE_DIR,
-                      STATUS_DIR, TRACE_DIR, UI_PORT, UI_URL, WRAPPER, doctor_checks)
+from .tmsetup import (
+    DEFAULT_HOOK_LINK,
+    DEFAULT_SETTINGS,
+    DEFAULT_TM_LINK,
+    DEFAULT_TMUX_CONF,
+    STATE_DIR,
+    STATUS_DIR,
+    TRACE_DIR,
+    UI_PORT,
+    UI_URL,
+    WRAPPER,
+    doctor_checks,
+)
 
 PIDFILE = STATE_DIR / "ui.pid"
 # written by a server started before a rename, in a state dir `kalmux setup` has not migrated yet
@@ -310,6 +349,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="kalmux", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
                                 epilog="examples:\n  kalmux ls\n  kalmux color my-proj orange\n  kalmux go my-proj\n  kalmux open my-proj\n  kalmux attach my-proj\n"
                                        "  kalmux new my-proj --cwd ~/Dev/my-proj --color teal --claude\n  kalmux dead\n  kalmux resume alpha\n  kalmux ui show\n  kalmux doctor\n  kalmux setup")
+    p.add_argument("-V", "--version", action="version", version=f"kalmux {VERSION}")
     sub = p.add_subparsers(dest="cmd")
     ls = sub.add_parser("ls", help="list tmux sessions with Claude state (works over SSH)")
     ls.add_argument("--json", action="store_true")

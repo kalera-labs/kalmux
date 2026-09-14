@@ -6,7 +6,8 @@ import time
 from pathlib import Path
 
 import pytest
-import tmstatusline
+
+from kalmux import tmstatusline
 
 PAYLOAD = {
     "session_id": "0f7b1c2d-3e4f-4a5b-8c9d-0e1f2a3b4c5d",

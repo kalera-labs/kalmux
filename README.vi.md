@@ -53,10 +53,19 @@ Ba mảnh nhỏ làm hết việc: một cái hook wrapper, CLI `kalmux`, và m�
 Cần macOS với iTerm2 3.7 trở lên, tmux 3.x, Python 3.11 trở lên, `jq`, và `uv` để đăng ký toolbelt.
 
 ```bash
-git clone https://github.com/3d-era/kalmux.git
+brew install kalera-labs/tap/kalmux
+kalmux setup
+```
+
+Hoặc clone về, cách này cũng là cách để sửa code:
+
+```bash
+git clone https://github.com/kalera-labs/kalmux.git
 cd kalmux
 bin/kalmux setup
 ```
+
+Kiểu nào thì `kalmux` cũng nằm sẵn trong PATH: Homebrew tự đặt lệnh vô đó, còn clone thì `setup` trỏ `~/.local/bin/kalmux` về `bin/kalmux`.
 
 `setup` chạy lại bao nhiêu lần cũng được và gỡ ra được. Nó tạo `~/.config/kalmux/config.toml`, link hook với CLI, chỉnh hai tùy chọn của iTerm2, thêm một khối được quản lý vô `~/.tmux.conf`, cài script AutoLaunch cho iTerm2 khởi động server UI, cho status line của Claude Code đi qua Kalmux, đăng ký tool trong toolbelt, rồi chạy `kalmux doctor` khép lại.
 
@@ -66,7 +75,7 @@ Xong thì mở toolbelt: **View > Toolbelt** (⇧⌘B) rồi chọn **Kalmux**. 
 <summary>Setup đụng tới đâu, và vì sao</summary>
 
 - `~/.config/iterm2/cc-status` → symlink tới hook wrapper. Đây là đường dẫn iTerm2 ghi vô `~/.claude/settings.json`. Cài lại tích hợp Claude Code của iTerm2 có thể làm mất link này; `kalmux doctor` phát hiện ra, `kalmux setup` gắn lại.
-- `~/.local/bin/kalmux` → chính CLI. `kmux` với `tm` vẫn còn làm alias trỏ cùng chỗ, nên tay quen gõ kiểu cũ hoặc script cũ vẫn chạy.
+- `~/.local/bin/kalmux` → chính CLI, khi chạy từ bản clone. `kmux` với `tm` vẫn còn làm alias trỏ cùng chỗ, nên tay quen gõ kiểu cũ hoặc script cũ vẫn chạy. Cài bằng gói thì cái tên đó đã có chủ, `setup` để yên không đụng.
 - Tùy chọn iTerm2 `OpenTmuxWindowsIn=2` (window tmux mở thành tab trong cửa sổ đang attach) và `AutoHideTmuxClientSession=true`.
 - Một khối được quản lý trong `~/.tmux.conf`: `allow-passthrough on`, status line hiện `[working]` / `[waiting]` cho từng window, và một hook `client-attached` phát lại trạng thái với màu vô tab mới.
 - `~/Library/Application Support/iTerm2/Scripts/AutoLaunch.scpt`, khởi động server UI mỗi lần iTerm2 mở. Script AutoLaunch do bạn tự viết thì không bao giờ bị ghi đè. Script sinh ra có nhúng sẵn đường dẫn tuyệt đối của trình thông dịch và một tiền tố `PATH`, tại iTerm2 khởi động với `PATH` của login shell, chỗ đó không thấy `python3` đời mới lẫn `tmux` của Homebrew, mà server không tìm ra `tmux` thì toolbelt trống trơn sau mỗi lần khởi động máy.
@@ -159,12 +168,13 @@ Sau khi sửa code của Kalmux thì chạy `kalmux ui restart` từ một shell
 ## Phát triển
 
 ```bash
-uv run --no-project --with pytest --with pytest-cov python -m pytest -q --cov=bin --cov=lib --cov-report=term-missing
+uv run --no-project --with pytest --with pytest-cov python -m pytest -q --cov=src/kalmux --cov-report=term-missing
+uvx ruff check .
 python3 scripts/dev/mock_server.py 47399    # giao diện với dữ liệu giả ở http://127.0.0.1:47399/
 kalmux ui restart                           # sau khi sửa code server, chạy từ shell trong iTerm2
 ```
 
-Chỉ xài thư viện chuẩn của Python, không phụ thuộc gì lúc chạy. `lib/` chứa mấy module, `bin/` chứa hai file thực thi, `ui/index.html` là toàn bộ giao diện gói trong một file vanilla JS.
+Chỉ xài thư viện chuẩn của Python, không phụ thuộc gì lúc chạy. `src/kalmux/` chứa mấy module, `src/kalmux/assets/` chứa hook wrapper với toàn bộ giao diện gói trong một file vanilla JS, `bin/kalmux` cho phép chạy thẳng từ bản clone.
 
 ## Giấy phép
 

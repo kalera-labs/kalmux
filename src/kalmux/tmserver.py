@@ -20,15 +20,40 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from tmactions import (Result, TabMap, action_color, action_detach, action_forget, action_go, action_kill, action_new,
-                       action_open, action_rename, action_resume, find_trail, next_waiting, reapply,
-                       reapply_later, snapshot, trails_named)
-from tmconfig import config_path, load_config
-from tmcore import DEFAULT_REGISTRY, PALETTE, ROOT, VERSION, It2, Tmux, load_registry, resumable_trails
+from .tmactions import (
+    Result,
+    TabMap,
+    action_color,
+    action_detach,
+    action_forget,
+    action_go,
+    action_kill,
+    action_new,
+    action_open,
+    action_rename,
+    action_resume,
+    find_trail,
+    next_waiting,
+    reapply,
+    reapply_later,
+    snapshot,
+    trails_named,
+)
+from .tmconfig import config_path, load_config
+from .tmcore import (
+    ASSETS,
+    DEFAULT_REGISTRY,
+    PALETTE,
+    VERSION,
+    It2,
+    Tmux,
+    load_registry,
+    resumable_trails,
+)
 
 APP_NAME = "kalmux"
 LEGACY_APP_NAMES = ("kmux", "tmux-manager")   # a server started before a rename must stay stoppable
-UI_PATH = ROOT / "ui" / "index.html"
+UI_PATH = ASSETS / "index.html"
 MAX_BODY = 64 * 1024
 UI_PALETTE = {k: v for k, v in PALETTE.items() if k != "grey"}
 ACTIONS = ("go", "open", "color", "new", "kill", "rename", "detach", "next-waiting", "reapply", "resume", "forget")
@@ -48,7 +73,7 @@ def csp(nonce: str) -> str:
 
 def state_dirs() -> tuple[Path, Path]:
     # lazy: tmsetup imports this module, so importing it at the top would loop
-    from tmsetup import STATUS_DIR, TRACE_DIR
+    from .tmsetup import STATUS_DIR, TRACE_DIR
     return STATUS_DIR, TRACE_DIR
 
 
@@ -188,7 +213,7 @@ class Handler(BaseHTTPRequestHandler):
     def backend(self) -> Backend:
         return self.server.backend  # type: ignore[attr-defined]
 
-    def log_message(self, fmt, *args):  # noqa: D401 - quiet by default, debug via logging
+    def log_message(self, fmt, *args):
         log.debug("%s " + fmt, self.address_string(), *args)
 
     def _allowed_hosts(self) -> set[str]:
@@ -256,10 +281,10 @@ class Handler(BaseHTTPRequestHandler):
         return data if isinstance(data, dict) else None
 
     # ---- routes
-    def do_HEAD(self) -> None:  # noqa: N802
+    def do_HEAD(self) -> None:
         self.do_GET()
 
-    def do_GET(self) -> None:  # noqa: N802
+    def do_GET(self) -> None:
         if not self._origin_ok():
             return self._fail(HTTPStatus.FORBIDDEN, "bad host/origin")
         path = self.path.split("?", 1)[0]
@@ -285,7 +310,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._fail(HTTPStatus.INTERNAL_SERVER_ERROR, f"state failed: {type(exc).__name__}: {exc}")
         return self._fail(HTTPStatus.NOT_FOUND, "not found")
 
-    def do_POST(self) -> None:  # noqa: N802
+    def do_POST(self) -> None:
         if not self._origin_ok():
             return self._refuse(HTTPStatus.FORBIDDEN, "bad host/origin")
         if not self._token_ok():

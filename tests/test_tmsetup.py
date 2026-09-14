@@ -5,8 +5,8 @@ import shutil
 from pathlib import Path
 
 import pytest
-import tmserver
-import tmsetup
+
+from kalmux import tmserver, tmsetup
 
 
 def test_managed_block_has_passthrough_and_replay_hook():
@@ -270,8 +270,8 @@ def test_doctor_checks_full_report(tmp_path):
     report = tmsetup.doctor_checks(ui_health=lambda: healthy, autolaunch=lambda: "ours", **common)
     names = {c["name"]: c for c in report}
     assert names["hook symlink -> wrapper"]["ok"] and names["key hook events wired"]["ok"] and names["tmux.conf client-attached hook (status replay)"]["ok"]
-    assert names["kalmux symlink -> bin/kalmux"]["ok"]
-    assert names["kmux alias -> bin/kalmux"]["ok"] and names["tm alias -> bin/kalmux"]["ok"]
+    assert names["kalmux on PATH"]["ok"]
+    assert names["kmux alias"]["ok"] and names["tm alias"]["ok"]
     if os.uname().sysname == "Darwin":
         assert names["iTerm2 toolbelt tool registered"]["ok"] and names["iTerm2 AutoLaunch script starts the ui server"]["ok"]
         assert names["AutoLaunch script targets exist"]["ok"]
@@ -287,8 +287,8 @@ def test_doctor_checks_full_report(tmp_path):
     alias_links[1].unlink()
     alias_links[1].symlink_to(tmsetup.ROOT / "bin" / "tm")
     broken = {c["name"]: c for c in tmsetup.doctor_checks(ui_health=lambda: None, autolaunch=lambda: "ours", **{**common, "autolaunch_paths": lambda: ["/nonexistent/python3"]})}
-    assert broken["tm alias -> bin/kalmux"]["ok"] is False and "bin/tm" in broken["tm alias -> bin/kalmux"]["info"]
-    assert broken["kmux alias -> bin/kalmux"]["ok"] is True
+    assert broken["tm alias"]["ok"] is False and "bin/tm" in broken["tm alias"]["info"]
+    assert broken["kmux alias"]["ok"] is True
     if os.uname().sysname == "Darwin":
         assert broken["AutoLaunch script targets exist"]["ok"] is False and "/nonexistent/python3" in broken["AutoLaunch script targets exist"]["info"]
     # --no-ui machines: no toolbelt / AutoLaunch / server checks at all
@@ -323,7 +323,7 @@ def test_setup_steps_include_ui_only_on_request(monkeypatch):
                      "kmux alias symlink (skipped if the path is not ours)",
                      "tm alias symlink (skipped if the path is not ours)",
                      "iTerm2 prefs", "tmux.conf block", tmsetup.STATUSLINE_STEP]
-    assert tmsetup.STATE_DIR_STEP == f"state directory (migrates {Path.home() / '.local/state/kmux'})"
+    assert f"state directory (migrates {Path.home() / '.local/state/kmux'})" == tmsetup.STATE_DIR_STEP
     if os.uname().sysname == "Darwin":
         steps = dict(tmsetup.setup_steps(ui=True))
         assert len(steps) == 12
@@ -369,7 +369,7 @@ def test_state_dir_derives_the_status_and_trace_dirs():
     assert tmsetup.STATUS_DIR == tmsetup.STATE_DIR / "status" and tmsetup.TRACE_DIR == tmsetup.STATE_DIR / "trace"
     assert tmsetup.state_dir({"KALMUX_STATE_DIR": "/tmp/elsewhere"}) == Path("/tmp/elsewhere")
     assert tmsetup.state_dir({"HOME": "/Users/x"}) == Path("/Users/x/.local/state/kalmux")
-    assert tmsetup.LEGACY_STATE_DIRS == (Path.home() / ".local/state/kmux", Path.home() / ".local/state/tm")
+    assert (Path.home() / ".local/state/kmux", Path.home() / ".local/state/tm") == tmsetup.LEGACY_STATE_DIRS
 
 
 def test_doctor_checks_report_the_status_line_tap(tmp_path):
@@ -499,9 +499,10 @@ def test_importing_tmsetup_does_not_drag_in_the_server_stack():
     import subprocess
     import sys
 
-    lib = str(Path(tmsetup.__file__).resolve().parent)
-    code = "import sys; import tmsetup; print(sorted(m for m in ('tmserver', 'http.client', 'ssl') if m in sys.modules))"
-    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, cwd=lib, check=True)
+    src = str(Path(tmsetup.__file__).resolve().parents[1])
+    code = ("import sys; import kalmux.tmsetup; "
+            "print(sorted(m for m in ('kalmux.tmserver', 'http.client', 'ssl') if m in sys.modules))")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, cwd=src, check=True)
     assert out.stdout.strip() == "[]"
 
 

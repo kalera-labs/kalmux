@@ -1,5 +1,3 @@
-import importlib.machinery
-import importlib.util
 import os
 import pathlib
 import stat
@@ -10,19 +8,16 @@ import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 BIN = ROOT / "bin"
-LIB = ROOT / "lib"
-if str(LIB) not in sys.path:
-    sys.path.insert(0, str(LIB))
+SRC = ROOT / "src"
+ASSETS = SRC / "kalmux" / "assets"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
 
 
 def load_tm():
-    """Load bin/kalmux (no .py suffix) as a module named `tm`."""
-    loader = importlib.machinery.SourceFileLoader("tm", str(BIN / "kalmux"))
-    spec = importlib.util.spec_from_loader("tm", loader)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["tm"] = mod
-    loader.exec_module(mod)
-    return mod
+    """The command layer, under the short name the tests have always used."""
+    from kalmux import cli
+    return cli
 
 
 @pytest.fixture(scope="session")

@@ -1,17 +1,25 @@
-"""Unit + CLI tests for bin/tm (core parsing/merging/rendering and the command layer)."""
+"""Unit + CLI tests for the kalmux command layer (core parsing/merging/rendering and the commands)."""
 import io
 import json
 import os
-import pathlib
 import subprocess
 import sys
 
 import pytest
-from fakes import FakeIt2, FakeTmux, it2_json, it2_json_row, it2_row, pane, tmux_line, write_status, write_trail
 
-import tmconfig
-import tmcore
-import tmsetup
+from conftest import BIN
+from fakes import (
+    FakeIt2,
+    FakeTmux,
+    it2_json,
+    it2_json_row,
+    it2_row,
+    pane,
+    tmux_line,
+    write_status,
+    write_trail,
+)
+from kalmux import tmconfig, tmcore, tmsetup
 
 
 # ---------- colors ----------
@@ -227,7 +235,7 @@ def test_fmt_age(tm):
 
 
 def test_render_table_contains_key_columns(tm):
-    rows = tm.merge([pane("api", state="working", detail="Edit", since="0", title="✳ Phase 2 thi công", color="#ff9500", path="/Volumes/Dev/api-svc")], {}, now=60)
+    rows = tm.merge([pane("api", state="working", detail="Edit", since="0", title="✳ Phase 2 — wiring the índex", color="#ff9500", path="/Volumes/Dev/api-svc")], {}, now=60)
     out = tm.render_table(rows)
     assert "api" in out and "working" in out and "api-svc" in out and "Phase 2" in out and "#ff9500" in out
 
@@ -876,7 +884,7 @@ def test_doctor_and_setup_thread_the_no_statusline_flag(tm, monkeypatch, capsys)
 
 
 def test_the_tap_runs_end_to_end_through_the_cli(tm, tmp_path):
-    """The real bin/kalmux, a real child process: bytes in, bytes out, exit status and stderr preserved."""
+    """The real command, a real child process: bytes in, bytes out, exit status and stderr preserved."""
     state = tmp_path / "state"
     state.mkdir()
     sink = tmp_path / "sink"
@@ -886,7 +894,7 @@ def test_the_tap_runs_end_to_end_through_the_cli(tm, tmp_path):
                           "model": {"display_name": "Opus 5"},
                           "context_window": {"used_percentage": 42}}).encode()
     env = {**os.environ, "HOME": str(tmp_path), "KALMUX_STATE_DIR": str(state)}
-    p = subprocess.run([sys.executable, str(pathlib.Path(tm.__file__).resolve()), "statusline"], input=payload,
+    p = subprocess.run([sys.executable, str(BIN / "kalmux"), "statusline"], input=payload,
                        env=env,
                        capture_output=True, check=False)
     assert p.returncode == 7 and p.stdout == b"" and p.stderr == b"boom\n"

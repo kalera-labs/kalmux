@@ -21,7 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-INDEX = ROOT / "ui" / "index.html"
+INDEX = ROOT / "src" / "kalmux" / "assets" / "index.html"
 
 TOKEN = secrets.token_hex(16)
 PALETTE = {          # the 20 names of lib/tmcore.PALETTE (without the "grey" alias)
@@ -40,12 +40,12 @@ _seq = [0]
 
 def guid() -> str:
     _seq[0] += 1
-    return "%s-58DD-4ADD-9F17-%012d" % (secrets.token_hex(4).upper(), _seq[0])
+    return f"{secrets.token_hex(4).upper()}-58DD-4ADD-9F17-{_seq[0]:012d}"
 
 
 def pane(pid: str, win: str, **kw) -> dict:
     p = {
-        "pane": "%s.%s" % (win, pid), "window_id": win, "pane_id": pid, "claude": True,
+        "pane": f"{win}.{pid}", "window_id": win, "pane_id": pid, "claude": True,
         "state": "idle", "source": "hook", "detail": "", "title": "", "age": 0,
         "stale": False, "path": "", "guid": "", "iterm2_window": "", "iterm2_tab": "", "active": True,
     }
@@ -177,7 +177,7 @@ def snapshot() -> dict:
             "claude_session_id": s.get("claude_session_id", ""), "ctx_pct": s.get("ctx_pct"),
             "model": s.get("model", ""), "cost_usd": s.get("cost_usd"), "quota": QUOTA if s.get("model") else None,
         })
-    counts = {k: 0 for k in ("waiting", "working", "idle", "busy", "unknown", "stale", "gone")}
+    counts = dict.fromkeys(("waiting", "working", "idle", "busy", "unknown", "stale", "gone"), 0)
     for s in out:
         if s["state"] in counts:
             counts[s["state"]] += 1
@@ -212,11 +212,11 @@ def attach_tab(s) -> None:
 def act_go(b):
     s = find(b.get("session", ""))
     if not s:
-        return 404, False, "No session named %r" % b.get("session", ""), {}
+        return 404, False, "No session named {!r}".format(b.get("session", "")), {}
     if s["in_iterm2"]:
-        return 200, True, "Jumped to %s" % s["name"], {"opened": False}
+        return 200, True, "Jumped to {}".format(s["name"]), {"opened": False}
     attach_tab(s)
-    return 200, True, "Opened a tab for %s" % s["name"], {"opened": True}
+    return 200, True, "Opened a tab for {}".format(s["name"]), {"opened": True}
 
 
 def act_open(b):
@@ -224,7 +224,7 @@ def act_open(b):
     if not s:
         return 404, False, "No such session", {}
     attach_tab(s)
-    return 200, True, "Opened another tab for %s" % s["name"], {"opened": True}
+    return 200, True, "Opened another tab for {}".format(s["name"]), {"opened": True}
 
 
 def act_color(b):
@@ -234,14 +234,14 @@ def act_color(b):
     c = str(b.get("color", "")).strip()
     if c == "none":
         s["color"] = ""
-        return 200, True, "Cleared the color of %s" % s["name"], {}
+        return 200, True, "Cleared the color of {}".format(s["name"]), {}
     if c in PALETTE:
         s["color"] = PALETTE[c]
     elif HEX_RE.match(c):
         s["color"] = c.lower()
     else:
-        return 400, False, "Invalid color: %s" % c, {}
-    return 200, True, "Recolored %s" % s["name"], {}
+        return 400, False, f"Invalid color: {c}", {}
+    return 200, True, "Recolored {}".format(s["name"]), {}
 
 
 def act_new(b):
@@ -249,7 +249,7 @@ def act_new(b):
     if not NAME_RE.match(name):
         return 400, False, "Invalid name (letters, digits, _ and - only)", {}
     if find(name):
-        return 400, False, "Session %s already exists" % name, {}
+        return 400, False, f"Session {name} already exists", {}
     cwd = str(b.get("cwd", "")).strip() or "~"
     path = os.path.expanduser(cwd)
     start = bool(b.get("start_claude"))
@@ -264,7 +264,7 @@ def act_new(b):
     act_color({"session": name, "color": str(b.get("color", "none")) or "none"})
     if b.get("open"):
         attach_tab(s)
-    return 200, True, "Created %s" % name, {"opened": bool(b.get("open"))}
+    return 200, True, f"Created {name}", {"opened": bool(b.get("open"))}
 
 
 def act_kill(b):
@@ -272,7 +272,7 @@ def act_kill(b):
     if not s:
         return 404, False, "No such session", {}
     SESSIONS.remove(s)
-    return 200, True, "Killed %s" % s["name"], {}
+    return 200, True, "Killed {}".format(s["name"]), {}
 
 
 def act_rename(b):
@@ -283,9 +283,9 @@ def act_rename(b):
     if not NAME_RE.match(new):
         return 400, False, "Invalid new name", {}
     if find(new):
-        return 400, False, "The name %s is taken" % new, {}
+        return 400, False, f"The name {new} is taken", {}
     s["name"] = new
-    return 200, True, "Renamed to %s" % new, {}
+    return 200, True, f"Renamed to {new}", {}
 
 
 def act_detach(b):
@@ -296,7 +296,7 @@ def act_detach(b):
     s["in_iterm2"] = False
     for p in s["panes"]:
         p["guid"] = p["iterm2_window"] = p["iterm2_tab"] = ""
-    return 200, True, "Detached every client of %s" % s["name"], {}
+    return 200, True, "Detached every client of {}".format(s["name"]), {}
 
 
 def act_next_waiting(_b):
@@ -304,7 +304,7 @@ def act_next_waiting(_b):
         if s["state"] == "waiting":
             if not s["in_iterm2"]:
                 attach_tab(s)
-            return 200, True, "Went to %s" % s["name"], {"session": s["name"]}
+            return 200, True, "Went to {}".format(s["name"]), {"session": s["name"]}
     return 200, False, "No session is waiting for you right now", {}
 
 
@@ -352,7 +352,7 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):  # terser than the default, to keep the terminal readable
-        sys.stderr.write("  %s %s\n" % (self.command, self.path))
+        sys.stderr.write(f"  {self.command} {self.path}\n")
 
     # -- send helpers ---------------------------------------------------
     def _send(self, code, body: bytes, ctype: str, extra=None):
@@ -381,9 +381,8 @@ class Handler(BaseHTTPRequestHandler):
         src = (src.replace("__TM_NONCE__", nonce)
                   .replace("__TM_TOKEN__", TOKEN)
                   .replace("__TM_PALETTE__", html.escape(json.dumps(PALETTE), quote=True)))
-        csp = ("default-src 'none'; script-src 'nonce-%s'; style-src 'nonce-%s'; "
-               "connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'"
-               % (nonce, nonce))
+        csp = (f"default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; "
+               "connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'")
         self._send(200, src.encode("utf-8"), "text/html; charset=utf-8",
                    {"Content-Security-Policy": csp})
 
@@ -411,13 +410,13 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 self._json(200, True, "", snapshot())
         else:
-            self._json(404, False, "No such path: %s" % path, {})
+            self._json(404, False, f"No such path: {path}", {})
 
     def do_POST(self):
         path = self.path.split("?", 1)[0]
         fn = ROUTES.get(path)
         if fn is None:
-            self._json(404, False, "No such path: %s" % path, {})
+            self._json(404, False, f"No such path: {path}", {})
             return
         if not self._guard():
             return
@@ -425,15 +424,15 @@ class Handler(BaseHTTPRequestHandler):
             n = int(self.headers.get("Content-Length") or 0)
             body = json.loads(self.rfile.read(n) or b"{}") if n else {}
             if not isinstance(body, dict):
-                raise ValueError("the body must be a JSON object")
-        except Exception as e:
-            self._json(400, False, "Bad JSON: %s" % e, {})
+                raise ValueError("the body must be a JSON object")  # noqa: TRY004 - answered as HTTP 400, not a type bug
+        except Exception as e:  # noqa: BLE001 - a mock must answer 400, never die on a bad body
+            self._json(400, False, f"Bad JSON: {e}", {})
             return
         try:
             with LOCK:
                 code, ok, msg, data = fn(body)
-        except Exception as e:  # never let the mock die mid-request
-            self._json(500, False, "Server error: %s" % e, {})
+        except Exception as e:  # noqa: BLE001 - never let the mock die mid-request
+            self._json(500, False, f"Server error: {e}", {})
             return
         self._json(code, ok, msg, data)
 
@@ -441,7 +440,7 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> int:
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 47399
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    print("tm mock  http://127.0.0.1:%d/   token=%s" % (port, TOKEN), flush=True)
+    print(f"kalmux mock  http://127.0.0.1:{port}/   token={TOKEN}", flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

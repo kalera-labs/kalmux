@@ -51,7 +51,12 @@ TMUX_FMT = SEP.join([
 ])
 assert len(FIELDS) == len(TMUX_FMT.split(SEP)), "FIELDS and TMUX_FMT must stay in lockstep (parse_panes drops every record otherwise)"
 IT2_BUNDLED = "/Applications/iTerm.app/Contents/Resources/utilities/it2"
-ROOT = Path(__file__).resolve().parent.parent
+PKG_DIR = Path(__file__).resolve().parent              # where the modules live (a clone or site-packages)
+ASSETS = PKG_DIR / "assets"                            # cc-status-tmux, index.html, it2_toolbelt.py
+_checkout = PKG_DIR.parent.parent
+# Running straight from a git clone (bin/kalmux, or an editable install) rather than from an installed wheel.
+SOURCE_CHECKOUT = _checkout if (_checkout / "pyproject.toml").is_file() and (_checkout / "bin" / "kalmux").is_file() else None
+ROOT = SOURCE_CHECKOUT or PKG_DIR                      # a symlink pointing inside this is one of ours
 DEFAULT_REGISTRY = Path.home() / ".claude/sessions"
 SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}$")
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
