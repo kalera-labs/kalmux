@@ -231,7 +231,9 @@ def _ui_start() -> int:
     if health(UI_PORT):
         print(f"kalmux ui: already running on {UI_URL}")
         return 0
-    if tmsetup.start_server(Path(os.path.realpath(__file__))):
+    # tmsetup.CLI, never this module's own path: the server is spawned as `python3 <script> ui serve`,
+    # and cli.py is a package module — running it as a script dies on its relative imports.
+    if tmsetup.start_server(tmsetup.CLI):
         print(f"kalmux ui: running on {UI_URL}")
         return 0
     print(f"kalmux ui: server did not come up; see {tmsetup.UI_LOG}", file=sys.stderr)

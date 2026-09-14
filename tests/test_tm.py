@@ -543,8 +543,11 @@ def test_ui_status_start_stop_paths(tm, monkeypatch, tmp_path, capsys):
         pidfile.write_text("4242")
         assert tm.main(["ui", "stop"]) == 0 and killed[-1] == (4242, tm.signal.SIGTERM) and len(killed) == i
         assert not pidfile.exists()
-    monkeypatch.setattr(tmsetup, "start_server", lambda path: True)
+    started: list = []
+    monkeypatch.setattr(tmsetup, "start_server", lambda path: started.append(path) or True)
     assert tm.main(["ui", "start"]) == 0 and "running on" in capsys.readouterr().out
+    # it must spawn a script python can run on its own, not this package module (which needs its parent)
+    assert started[-1] == tmsetup.CLI and started[-1].name != "cli.py"
     assert tm.main(["ui", "restart"]) == 0 and "running on" in capsys.readouterr().out
     monkeypatch.setattr(tmsetup, "start_server", lambda path: False)
     assert tm.main(["ui", "start"]) == 1 and "did not come up" in capsys.readouterr().err
