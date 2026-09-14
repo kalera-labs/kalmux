@@ -59,6 +59,8 @@ brew install kalera-labs/tap/kalmux
 kalmux setup
 ```
 
+Homebrew đời mới hỏi mình có tin cái tap của bên thứ ba không rồi mới chịu chạy formula: `brew trust kalera-labs/tap`.
+
 Hoặc clone về, cách này cũng là cách để sửa code:
 
 ```bash

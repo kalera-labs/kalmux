@@ -59,6 +59,8 @@ brew install kalera-labs/tap/kalmux
 kalmux setup
 ```
 
+Recent Homebrew asks you to vouch for a third-party tap before it will run its formula: `brew trust kalera-labs/tap`.
+
 Or from a clone, which is also how you hack on it:
 
 ```bash

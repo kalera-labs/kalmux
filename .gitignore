@@ -13,3 +13,4 @@ dist/
 # local-only: agent rules and internal design notes (they name real projects and machines)
 CLAUDE.md
 docs/superpowers/
+docs/launch/
