@@ -145,9 +145,16 @@ resume_mode = "type"
 
 [tombstones]
 keep_days = 30
+
+[notify]
+# "auto": post the iTerm2 alert Claude Code skips inside tmux, unless you set preferredNotifChannel yourself.
+iterm2 = "auto"
+bell = false
 ```
 
 If you live in `--dangerously-skip-permissions`, put it in these templates once and both `new` and `resume` will follow. Changes take effect immediately; no restart.
+
+**Notifications.** Claude Code picks its notification channel from `TERM_PROGRAM`. tmux sets that to `tmux`, so inside tmux the default `auto` channel finds no method and Claude posts nothing, while the same Claude in a plain iTerm2 tab posts a macOS notification, with its sound, the moment it needs you. That silence is the first thing people notice after moving their agents into tmux. Kalmux fills it: on the same `Notification` event the hook posts the same OSC 9 alert into the pane, and iTerm2 shows it exactly as it would have. `iterm2 = "auto"` steps aside as soon as `~/.claude.json` carries a `preferredNotifChannel` of your own (`claude config set -g preferredNotifChannel iterm2` also works inside tmux, since Claude wraps the sequence for tmux itself), `"always"` posts regardless, `"never"` turns it off, and `bell = true` adds the terminal bell, like Claude's own `iterm2_with_bell`.
 
 **State directory:** trails, status records and the saved status line live under `$KALMUX_STATE_DIR`, default `~/.local/state/kalmux` (`XDG_STATE_HOME` is not read). If you override it, set it somewhere Claude Code, the hook and the UI server all inherit, because a file written under one value is invisible to a reader started under another.
 

@@ -145,9 +145,16 @@ resume_mode = "type"
 
 [tombstones]
 keep_days = 30
+
+[notify]
+# "auto": đăng giùm cái thông báo iTerm2 mà Claude Code bỏ qua khi ở trong tmux, trừ khi bạn đã tự đặt preferredNotifChannel.
+iterm2 = "auto"
+bell = false
 ```
 
 Ai quen xài `--dangerously-skip-permissions` thì bỏ vô hai mẫu lệnh này một lần, `new` với `resume` tự theo. Sửa xong có hiệu lực liền, khỏi khởi động lại.
+
+**Thông báo.** Claude Code chọn kênh báo theo `TERM_PROGRAM`. tmux đặt biến đó thành `tmux`, nên trong tmux kênh mặc định `auto` không tìm ra cách nào và Claude im luôn, trong khi cũng Claude đó ở tab iTerm2 thường thì đăng thông báo macOS, có tiếng, ngay lúc nó cần mình. Cái im lặng này là thứ đầu tiên người ta để ý sau khi dọn hết agent vô tmux. Kalmux bù chỗ đó: đúng event `Notification` ấy, hook đăng cùng một cảnh báo OSC 9 vô pane, iTerm2 hiện y như cũ. `iterm2 = "auto"` tự nhường ngay khi `~/.claude.json` có `preferredNotifChannel` của riêng bạn (`claude config set -g preferredNotifChannel iterm2` cũng chạy được trong tmux, vì Claude tự bọc chuỗi cho tmux), `"always"` thì đăng bất kể, `"never"` tắt hẳn, còn `bell = true` thêm chuông terminal, giống `iterm2_with_bell` của Claude.
 
 **Thư mục trạng thái:** vệt, bản ghi status và status line đã lưu đều nằm dưới `$KALMUX_STATE_DIR`, mặc định `~/.local/state/kalmux` (Kalmux không đọc `XDG_STATE_HOME`). Nếu bạn đổi biến này thì đặt ở chỗ mà Claude Code, hook và server UI đều thừa hưởng, vì file ghi theo giá trị này thì bên kia đọc bằng giá trị khác sẽ không thấy.
 

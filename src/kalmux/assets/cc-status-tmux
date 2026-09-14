@@ -22,6 +22,7 @@ export LC_ALL=en_US.UTF-8   # unconditional: bash substring/tr must count charac
 ORIG="${CC_STATUS_ORIG:-/Applications/iTerm.app/Contents/Resources/utilities/cc-status}"
 MAX_DETAIL=120
 MAX_TRAIL=200                           # cap for the free text stored in a trail line
+MAX_ALERT=200                           # cap for the text of an OSC 9 alert
 MAX_FIELD=1000                          # cap applied by jq to every extracted field (see below)
 STALE_SESSION_START_SOURCES="compact"   # SessionStart(source=compact) fires mid-turn: keep the live state
 COLOR_WORKING='#ff9500'
@@ -65,6 +66,48 @@ sanitize() {
   s="$(printf '%s' "$s" | tr -s '[:space:]' ' ')"
   s="${s# }"; s="${s% }"
   printf '%s' "${s:0:$limit}"
+}
+
+# --- the alert Claude Code cannot post from inside tmux ------------------------------------
+# Claude Code picks its notification channel from TERM_PROGRAM. tmux sets that to "tmux", so the
+# default "auto" channel finds no method and every Claude in a tmux pane is silent, while the same
+# Claude in a plain iTerm2 tab posts an OSC 9 alert (a macOS notification, with its sound). The hook
+# posts that alert instead, on the very event Claude would have used. Not when the user picked a
+# channel in ~/.claude.json (then Claude posts, or chose not to, and a second copy is noise), and not
+# when [notify] in config.toml says never.
+config_file() {
+  if [ -n "${KALMUX_CONFIG:-}" ]; then printf '%s' "$KALMUX_CONFIG"
+  else printf '%s/kalmux/config.toml' "${XDG_CONFIG_HOME:-${HOME:-}/.config}"; fi
+}
+# One key of the [notify] table, read without a TOML parser (bash 3.2): the key must sit on its own
+# line under [notify], which is how the template is written. Quotes, spaces and comments are dropped.
+notify_setting() {
+  local f; f="$(config_file)"
+  [ -r "$f" ] || return 0
+  awk -v key="$1" -v q="'" '
+    /^[[:space:]]*\[/ { table = $0; gsub(/[[:space:]]/, "", table); next }
+    table == "[notify]" {
+      line = $0; sub(/#.*/, "", line)
+      if (match(line, "^[[:space:]]*" key "[[:space:]]*=")) {
+        v = substr(line, RLENGTH + 1); gsub("[[:space:]\"" q "]", "", v); print v; exit
+      }
+    }' "$f" 2>/dev/null
+}
+# Claude Code's own channel from its global config (~/.claude.json, or $CLAUDE_CONFIG_DIR/.claude.json).
+claude_notif_channel() {
+  local f
+  if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then f="$CLAUDE_CONFIG_DIR/.claude.json"; else f="${HOME:-}/.claude.json"; fi
+  [ -r "$f" ] || return 0
+  jq -r '.preferredNotifChannel // empty | tostring' "$f" 2>/dev/null | head -1
+}
+alert_text() {
+  local mode; mode="$(notify_setting iterm2)"
+  case "${mode:-auto}" in
+    never)  return 0 ;;
+    always) ;;
+    *)      case "$(claude_notif_channel)" in ""|auto) ;; *) return 0 ;; esac ;;
+  esac
+  sanitize "$message" $MAX_ALERT
 }
 
 # --- trail: one JSON line per lifecycle event, in ${KALMUX_STATE_DIR}/trace/<session_id>.jsonl
@@ -143,6 +186,8 @@ esac
 
 # --- 4) should the pane tty be touched at all? ----------------------------------------------
 # Writing on every tool call jitters the screen for no gain: the state is already in tmux.
+alert=""
+if [ "$event" = "Notification" ] && [ -n "$message" ]; then alert="$(alert_text)"; fi
 write=0
 [ "$clear" = 1 ] && write=1
 [ "$state" != "$prev_state" ] && write=1
@@ -158,6 +203,10 @@ b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
 
 # A leading ST closes any string a previously truncated write may have left open.
 seq="$(printf '\033\\')"
+if [ -n "$alert" ]; then                 # first: it is the point of this write
+  seq="$seq$(printf '\033]9;%s\007' "$alert")"
+  [ "$(notify_setting bell)" = "true" ] && seq="$seq$(printf '\007')"
+fi
 if [ "$clear" = 1 ]; then
   seq="$seq$(printf '\033]21337;status=;indicator=;status-color=;detail=\033\\\033]1337;SetUserVar=cc_state=\007')"
 else

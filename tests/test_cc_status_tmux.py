@@ -3,6 +3,8 @@ import base64
 import json
 import subprocess
 
+import pytest
+
 from conftest import ASSETS
 
 WRAPPER = ASSETS / "cc-status-tmux"
@@ -407,3 +409,88 @@ def test_unwritable_state_dir_does_not_break_the_hook(fake_env):
     assert r.returncode == 0 and r.stderr == ""
     assert "@cc_state idle" in tmux_log(fake_env)
     assert osc_status("idle", "#00d75f", "#888888", "✓ x") in tty_bytes(fake_env)
+
+
+# ---------- the alert Claude Code cannot post from inside tmux ----------
+def osc9(message):
+    return f"{ESC}]9;{message}{BEL}"
+
+
+def notif(fake_env, message="Claude is waiting for your input", ntype="idle_prompt", **kw):
+    return run_hook(fake_env, {"hook_event_name": "Notification", "notification_type": ntype, "message": message}, **kw)
+
+
+def test_notification_posts_the_iterm2_alert_claude_skips_in_tmux(fake_env):
+    """Claude Code picks its channel from TERM_PROGRAM, which tmux sets to `tmux`, and then finds no method at
+    all. The hook posts the OSC 9 alert Claude would have posted from a plain iTerm2 tab, on the same event."""
+    notif(fake_env)
+    out = tty_bytes(fake_env)
+    assert osc9("Claude is waiting for your input") in out
+    assert out.index(ESC + "]9;") < out.index(ESC + "]21337")      # the alert is the point of this write
+    assert osc9("Claude is waiting for your input") + BEL not in out  # no bell unless asked for
+
+
+def test_alert_text_is_sanitized_and_capped(fake_env):
+    notif(fake_env, "Allow " + ESC + "]0;evil" + BEL + " Bash;\nnow " + "y" * 400, ntype="permission_prompt")
+    out = tty_bytes(fake_env)
+    start = out.index(ESC + "]9;") + len(ESC + "]9;")
+    alert = out[start:out.index(BEL, start)]
+    assert ESC not in alert and ";" not in alert and "\n" not in alert and alert.startswith("Allow")
+    assert len(alert) <= 200
+
+
+def test_only_notification_events_post_alerts(fake_env):
+    run_hook(fake_env, {"hook_event_name": "PermissionRequest", "tool_name": "Bash"})
+    run_hook(fake_env, {"hook_event_name": "Stop", "last_assistant_message": "done"})
+    run_hook(fake_env, {"hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion",
+                        "tool_input": {"questions": [{"question": "which one?"}]}})
+    notif(fake_env, "", ntype="idle_prompt")                        # nothing to say: no empty alert either
+    assert ESC + "]9;" not in tty_bytes(fake_env)
+
+
+@pytest.mark.parametrize("channel", ["iterm2", "iterm2_with_bell", "terminal_bell", "kitty", "notifications_disabled"])
+def test_hook_steps_aside_when_the_user_picked_claudes_own_channel(fake_env, channel):
+    """With preferredNotifChannel set, Claude posts (or deliberately does not); a second alert would be noise."""
+    (fake_env["tmp"] / ".claude.json").write_text(json.dumps({"preferredNotifChannel": channel, "projects": {}}))
+    notif(fake_env)
+    assert ESC + "]9;" not in tty_bytes(fake_env)
+
+
+def test_channel_auto_is_the_same_as_unset(fake_env):
+    (fake_env["tmp"] / ".claude.json").write_text(json.dumps({"preferredNotifChannel": "auto"}))
+    notif(fake_env, "m")
+    assert osc9("m") in tty_bytes(fake_env)
+
+
+def test_claude_config_dir_is_honoured_for_the_channel(fake_env):
+    other = fake_env["tmp"] / "cfgdir"
+    other.mkdir()
+    (other / ".claude.json").write_text(json.dumps({"preferredNotifChannel": "terminal_bell"}))
+    notif(fake_env, "m", extra_env={"CLAUDE_CONFIG_DIR": str(other)})
+    assert ESC + "]9;" not in tty_bytes(fake_env)
+
+
+def test_notify_config_never_always_and_bell(fake_env):
+    cfg = fake_env["tmp"] / ".config" / "kalmux" / "config.toml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text('[claude]\nnew = "claude"\n\n[notify]\n# a comment\niterm2 = "never"   # trailing comment\n')
+    notif(fake_env, "m")
+    assert ESC + "]9;" not in tty_bytes(fake_env)
+
+    cfg.write_text("[notify]\niterm2='always'\nbell = true\n")      # no spaces, single quotes: still read
+    (fake_env["tmp"] / ".claude.json").write_text(json.dumps({"preferredNotifChannel": "iterm2"}))
+    notif(fake_env, "m")
+    assert osc9("m") + BEL in tty_bytes(fake_env)                   # posted despite Claude's channel, plus a bell
+
+    fake_env["tty"].write_text("")
+    cfg.write_text('[other]\niterm2 = "never"\n[notify]\nbell = false\n')   # the key only counts inside [notify]
+    (fake_env["tmp"] / ".claude.json").unlink()
+    notif(fake_env, "m")
+    assert osc9("m") in tty_bytes(fake_env) and osc9("m") + BEL not in tty_bytes(fake_env)
+
+
+def test_kalmux_config_env_points_the_hook_at_another_file(fake_env):
+    other = fake_env["tmp"] / "elsewhere.toml"
+    other.write_text('[notify]\niterm2 = "never"\n')
+    notif(fake_env, "m", extra_env={"KALMUX_CONFIG": str(other)})
+    assert ESC + "]9;" not in tty_bytes(fake_env)

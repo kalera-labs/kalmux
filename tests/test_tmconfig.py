@@ -43,6 +43,7 @@ def test_user_values_are_honoured(tmp_path):
     assert cfg["claude"]["new"] == "claude --dangerously-skip-permissions"
     assert cfg["claude"]["resume_mode"] == "run"
     assert cfg["tombstones"]["keep_days"] == 7
+    assert cfg["notify"] == {"iterm2": "auto", "bell": False}      # untouched section keeps its defaults
     assert tmconfig.render_resume(cfg, "7c9e1f20-4a3b-4d5e-9f01-2b3c4d5e6f70") == \
         "claude --resume 7c9e1f20-4a3b-4d5e-9f01-2b3c4d5e6f70 --dangerously-skip-permissions"
 
@@ -56,6 +57,9 @@ def test_user_values_are_honoured(tmp_path):
     ("[tombstones]\nkeep_days = true\n", "keep_days"),
     ('claude = "not a table"\n', "expected a table"),
     ("this is not toml =\n", "config.toml"),
+    ('[notify]\niterm2 = "loud"\n', "notify.iterm2"),
+    ('[notify]\nbell = "yes"\n', "notify.bell"),
+    ('notify = 3\n', "[notify]"),
 ])
 def test_bad_values_fall_back_to_defaults_and_report(tmp_path, body, expect):
     path = tmp_path / "config.toml"
@@ -114,3 +118,12 @@ def test_ensure_config_leaves_the_legacy_file_alone_when_a_new_one_exists(tmp_pa
     new.write_text('[claude]\nnew = "current"\n')
     assert tmconfig.ensure_config(env=env) is False
     assert legacy.read_text() == '[claude]\nnew = "old"\n' and new.read_text() == '[claude]\nnew = "current"\n'
+
+
+def test_notify_values_are_honoured_and_described(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text('[notify]\niterm2 = "never"\nbell = true\n')
+    cfg = tmconfig.load_config(path)
+    assert cfg["_errors"] == [] and cfg["notify"] == {"iterm2": "never", "bell": True}
+    assert "notify.iterm2 = 'never'" in tmconfig.describe(cfg)
+    assert tmconfig.NOTIFY_MODES == ("auto", "always", "never")

@@ -20,6 +20,10 @@ DEFAULTS: dict = {
     "tombstones": {
         "keep_days": 30,
     },
+    "notify": {
+        "iterm2": "auto",
+        "bell": False,
+    },
 }
 
 CONFIG_TEMPLATE = """\
@@ -36,9 +40,21 @@ resume_mode = "type"
 [tombstones]
 # Trail files older than this are pruned; gone sessions older than this are not offered for resume.
 keep_days = 30
+
+[notify]
+# Inside tmux, Claude Code posts no notification at all: it picks its channel from TERM_PROGRAM, which
+# tmux sets to "tmux", and finds no method. Kalmux posts the iTerm2 alert (a macOS notification, with its
+# sound) that the same Claude would post from a plain tab, on the same event.
+#   "auto"   only while ~/.claude.json has no preferredNotifChannel of its own (then Claude posts, not us)
+#   "always" post regardless      "never" stay quiet
+# The hook reads these two keys without a TOML parser: keep each on its own line under [notify].
+iterm2 = "auto"
+# Also ring the terminal bell with the alert, like Claude's own "iterm2_with_bell".
+bell = false
 """
 
 RESUME_MODES = ("type", "run")
+NOTIFY_MODES = ("auto", "always", "never")
 MAX_COMMAND = 512
 SESSION_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
@@ -111,6 +127,20 @@ def _validate(raw: dict) -> tuple[dict, list[str]]:
             cfg["tombstones"]["keep_days"] = v
         else:
             errors.append("tombstones.keep_days: expected an integer between 1 and 3650")
+    notify = raw.get("notify", {})
+    if not isinstance(notify, dict):
+        errors.append("[notify]: expected a table")
+        notify = {}
+    if "iterm2" in notify:
+        if notify["iterm2"] in NOTIFY_MODES:
+            cfg["notify"]["iterm2"] = notify["iterm2"]
+        else:
+            errors.append(f"notify.iterm2: expected one of {', '.join(NOTIFY_MODES)}")
+    if "bell" in notify:
+        if isinstance(notify["bell"], bool):
+            cfg["notify"]["bell"] = notify["bell"]
+        else:
+            errors.append("notify.bell: expected true or false")
     return cfg, errors
 
 
@@ -169,7 +199,7 @@ def describe(cfg: dict) -> str:
     """Human-readable dump for `kalmux config`."""
     path = cfg.get("_path", "")
     lines = [f"config: {path}" + ("" if Path(path).exists() else " (missing; defaults in effect; `kalmux setup` creates it)")]
-    for section in ("claude", "tombstones"):
+    for section in ("claude", "tombstones", "notify"):
         for key, value in cfg[section].items():
             lines.append(f"  {section}.{key} = {value!r}")
     for err in cfg.get("_errors", []):
