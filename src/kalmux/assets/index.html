@@ -1,0 +1,769 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<meta name="tm-token" content="__TM_TOKEN__">
+<meta name="tm-palette" content="__TM_PALETTE__">
+<title>Kalmux</title>
+<style nonce="__TM_NONCE__">
+/* ===== tokens (dark = iTerm2 toolbelt) ===== */
+:root{
+  --bg:#1f1f1f; --hdr:#262626; --card:#2b2b2b; --bd:#3a3a3a; --bd2:#4d4d4d;
+  --fg:#e6e6e6; --fg2:#cacaca; --dim:#9a9a9a; --acc:#0a84ff; --busy:#7fb8c9;
+  --wait:#5f87ff; --work:#ff9500; --idle:#6fae8b; --unk:#8e8e93; --gone:#a5564f;
+  --ok:#30d158; --warn:#ffd60a; --bad:#ff453a; --toast:#000000d0; --hov:#ffffff14;
+}
+@media (prefers-color-scheme:light){
+  :root{
+    --bg:#f4f4f5; --hdr:#e9e9ea; --card:#ffffff; --bd:#d6d6d8; --bd2:#b9b9bd;
+    --fg:#1c1c1e; --fg2:#333336; --dim:#6c6c72; --idle:#2f8b62; --gone:#c0453c; --busy:#2f7f96;
+    --toast:#2b2b2be8; --hov:#00000010; --warn:#b8860b;
+  }
+}
+*{box-sizing:border-box}
+html,body{margin:0;overflow-x:hidden}
+body{background:var(--bg);color:var(--fg);
+  font:12.5px/1.35 -apple-system,"SF Pro Text",Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased}
+button,input{font:inherit;color:inherit}
+button{background:none;border:0;cursor:pointer;padding:0}
+:focus-visible{outline:2px solid var(--acc);outline-offset:1px}
+.dim{color:var(--dim)}
+.clip{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+[hidden]{display:none !important}
+
+/* ===== header ===== */
+#top{position:sticky;top:0;z-index:20;background:var(--hdr);border-bottom:1px solid var(--bd)}
+#live{height:4px;background:var(--gone);transition:background .25s}
+#live.on{background:var(--ok)}
+.hrow{display:flex;align-items:center;gap:6px;padding:5px 8px 4px}
+#brand{font-weight:600;margin-right:auto;letter-spacing:.2px}
+.ic{min-width:24px;min-height:24px;border-radius:6px;display:inline-flex;
+  align-items:center;justify-content:center;border:1px solid transparent;line-height:1}
+.ic:hover{background:var(--hov);border-color:var(--bd)}
+#pills{display:flex;gap:4px;flex-wrap:wrap;padding:0 8px 5px}
+.cp{display:inline-flex;align-items:center;gap:4px;min-height:24px;padding:2px 8px;font-size:11.5px;
+  color:var(--dim);border:1px solid var(--bd);border-radius:999px;background:var(--card)}
+.cp b{color:var(--fg);font-variant-numeric:tabular-nums}
+.cp .d{width:7px;height:7px;border-radius:50%;background:var(--unk);flex:0 0 auto}
+.cp[aria-pressed=true]{border-color:var(--acc);color:var(--fg);box-shadow:inset 0 0 0 1px var(--acc)}
+.cp-waiting .d{background:var(--wait)} .cp-working .d{background:var(--work)}
+.cp-idle .d{background:var(--idle)}   .cp-other .d{background:var(--unk)}
+.cp-busy .d{background:var(--busy)}
+.srow{display:flex;gap:6px;flex-wrap:wrap;padding:0 8px 7px}
+#q{flex:1 1 130px;min-width:0;min-height:26px;padding:3px 8px;-webkit-appearance:none;
+  background:var(--card);border:1px solid var(--bd);border-radius:6px}
+.btn{min-height:26px;padding:3px 10px;background:var(--card);
+  border:1px solid var(--bd);border-radius:6px;white-space:nowrap}
+.btn:hover:not(:disabled){border-color:var(--bd2)}
+.btn:disabled{opacity:.4;cursor:default}
+.btn.pri{background:var(--acc);border-color:var(--acc);color:#fff}
+.btn.danger{color:var(--bad);border-color:var(--bad)}
+#gowait{flex:1 1 100%}
+@media (min-width:380px){#gowait{flex:0 0 auto}}
+#gowait.hot{animation:glow 1.7s ease-in-out infinite}
+@keyframes glow{50%{box-shadow:0 0 0 3px #5f87ff66}}
+
+/* ===== "new session" form ===== */
+#nf{display:grid;gap:5px;padding:7px 8px;background:var(--bg);border-top:1px solid var(--bd)}
+#nf input[type=text]{width:100%;min-height:26px;padding:3px 7px;
+  background:var(--card);border:1px solid var(--bd);border-radius:6px}
+.sw-grid{display:flex;flex-wrap:wrap;gap:5px}
+.sw{width:24px;height:24px;border-radius:50%;border:1px solid var(--bd);background:transparent}
+.sw.none{background:repeating-linear-gradient(45deg,var(--bd) 0 3px,transparent 3px 6px)}
+.sw[aria-pressed=true]{border-color:var(--fg);box-shadow:0 0 0 2px var(--bg) inset}
+.ck{display:inline-flex;align-items:center;gap:5px;min-height:24px;color:var(--fg2);cursor:pointer}
+.row{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.err{color:var(--bad);font-size:11px}
+#off{padding:4px 8px;font-size:11.5px;color:var(--gone);background:#a5564f22;border-top:1px solid var(--bd)}
+
+/* ===== session list ===== */
+#list{display:flex;flex-direction:column;gap:6px;padding:8px;max-width:760px;margin:0 auto}
+#empty{padding:22px 12px;text-align:center;color:var(--dim)}
+.card{position:relative;display:flex;gap:6px;padding:6px 6px 6px 0;cursor:pointer;
+  background:var(--card);border:1px solid var(--bd);border-radius:8px}
+.card:hover{border-color:var(--bd2)}
+.bar{flex:0 0 3px;margin:1px 0 1px 5px;border-radius:3px;background:var(--c,transparent)}
+.bar.none{background:repeating-linear-gradient(180deg,var(--bd2) 0 3px,transparent 3px 7px)}
+.main{flex:1 1 auto;min-width:0}
+.r1{display:flex;align-items:center;gap:5px;flex-wrap:wrap}
+.nm{font-family:ui-monospace,"SF Mono",Menlo,monospace;font-weight:700;
+  font-size:12px;overflow-wrap:anywhere}
+.pill{font-size:10.5px;line-height:15px;padding:0 5px;border-radius:4px;
+  background:#8e8e9330;color:var(--unk);white-space:nowrap}
+.pill.waiting{background:var(--wait);color:#fff;animation:pulse 1.8s ease-in-out infinite}
+.pill.working{background:var(--work);color:#2a1c00}
+.pill.idle{background:#6fae8b2e;color:var(--idle)}
+.pill.busy{background:#7fb8c92e;color:var(--busy)}
+.pill.stale{color:var(--dim);text-decoration:line-through}
+.pill.gone{background:#a5564f26;color:var(--gone)}
+@keyframes pulse{50%{opacity:.5}}
+.age{font-size:11px;color:var(--dim);font-variant-numeric:tabular-nums}
+.mk{font-size:11px;color:var(--dim);letter-spacing:2px}
+.r2{display:flex;gap:5px;font-size:11px;color:var(--dim)}
+.r2 .proj{flex:0 1 auto}
+.det{font-size:11.5px;color:var(--fg2)}
+.ttl{font-size:11.5px;color:var(--dim);display:-webkit-box;-webkit-line-clamp:2;
+  -webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere}
+.bdg{display:flex;gap:4px;flex-wrap:wrap;margin-top:2px}
+.b{font-size:10px;line-height:14px;padding:0 4px;color:var(--dim);
+  border:1px solid var(--bd2);border-radius:4px;white-space:nowrap}
+.panes{list-style:none;display:grid;gap:2px;margin:4px 0 0;padding:0 0 0 6px;border-left:1px solid var(--bd2)}
+.panes li{display:flex;gap:5px;align-items:center;font-size:11px;min-width:0}
+.dot{flex:0 0 6px;width:6px;height:6px;border-radius:50%;background:var(--unk)}
+.dot.waiting{background:var(--wait)} .dot.working{background:var(--work)}
+.dot.idle{background:var(--idle)}    .dot.gone{background:var(--gone)}
+.dot.busy{background:var(--busy)}
+.acts{display:flex;flex-direction:column;gap:3px;flex:0 0 auto}
+.acts .sw{width:24px;height:24px;border-radius:7px;padding:5px;background-clip:content-box}
+
+/* ===== context gauge, quota, gone ===== */
+.gauge{height:3px;margin:3px 6px 0 0;border-radius:2px;background:var(--bd);overflow:hidden}
+.gauge i{display:block;height:100%;width:0;border-radius:2px;background:var(--ok);transition:width .3s linear}
+.gauge.mid i{background:var(--warn)}
+.gauge.hi i{background:var(--bad)}
+.ctx{font-variant-numeric:tabular-nums;flex:0 0 auto}
+.ctx.mid{color:var(--warn)} .ctx.hi{color:var(--bad)}
+#quota{font-variant-numeric:tabular-nums}
+#quota.mid{color:var(--warn);border-color:var(--warn)}
+#quota.hi{color:var(--bad);border-color:var(--bad)}
+#gone{max-width:760px;margin:0 auto;padding:0 8px 10px}
+#gone-h{display:flex;align-items:center;gap:6px;width:100%;min-height:26px;padding:3px 6px;
+  font-size:11.5px;color:var(--dim);border:1px solid var(--bd);border-radius:6px;background:var(--card)}
+#gone-h b{color:var(--fg2);font-variant-numeric:tabular-nums}
+#gone-list{list-style:none;display:grid;gap:4px;margin:5px 0 0;padding:0}
+.gi{display:flex;gap:5px;align-items:center;flex-wrap:wrap;padding:4px 6px;font-size:11.5px;
+  background:var(--card);border:1px solid var(--bd);border-radius:7px}
+.gi .gn{font-family:ui-monospace,"SF Mono",Menlo,monospace;font-weight:600}
+.gi .gm{flex:1 1 120px;min-width:0;color:var(--dim)}
+.gi .btn{min-height:22px;padding:1px 7px;font-size:11px}
+
+/* ===== popover ===== */
+.pop{position:absolute;top:28px;right:6px;z-index:30;min-width:150px;max-width:calc(100vw - 26px);
+  padding:5px;cursor:default;background:var(--hdr);border:1px solid var(--bd2);
+  border-radius:8px;box-shadow:0 8px 22px #00000066}
+.pop .ph{font-size:10.5px;color:var(--dim);padding:2px 4px}
+.pop .ph.danger{color:var(--bad)}
+.pop input{width:100%;min-height:26px;padding:3px 6px;margin:2px 0;
+  background:var(--card);border:1px solid var(--bd);border-radius:6px}
+.pop input[aria-invalid]{border-color:var(--bad)}
+.mi{display:block;width:100%;text-align:left;min-height:26px;padding:4px 7px;border-radius:5px}
+.mi:hover{background:var(--hov)}
+.mi.danger{color:var(--bad)}
+
+/* ===== toast ===== */
+#toasts{position:fixed;left:8px;right:8px;bottom:8px;z-index:60;
+  display:flex;flex-direction:column;gap:4px;pointer-events:none}
+.toast{padding:5px 9px;font-size:11.5px;color:#fff;background:var(--toast);
+  border:1px solid var(--bd2);border-radius:7px;overflow-wrap:anywhere;animation:rise .18s ease-out}
+.toast.bad{border-color:var(--bad);color:#ffb9b3}
+@keyframes rise{from{opacity:0;transform:translateY(5px)}}
+@media (prefers-reduced-motion:reduce){*{animation:none !important}}
+</style>
+</head>
+<body>
+
+<header id="top">
+  <div id="live" title="offline" role="status" aria-label="Connection"></div>
+  <div class="hrow">
+    <span id="brand">Kalmux</span>
+    <span id="noit2" class="b" hidden title="iTerm2 is not answering (it2 failed, or its Python API is off): jumping to a tab and opening one will fail">iTerm2 silent</span>
+    <span id="quota" class="b" hidden title="Claude rate limit"></span>
+    <span id="livedot" class="dim" title="offline">○</span>
+    <button class="ic" id="add" title="New session" aria-label="New session">＋</button>
+  </div>
+  <div id="pills">
+    <button class="cp cp-waiting" data-f="waiting" aria-pressed="false" title="Filter: waiting for you"><i class="d"></i>waiting <b>0</b></button>
+    <button class="cp cp-working" data-f="working" aria-pressed="false" title="Filter: Claude is working"><i class="d"></i>working <b>0</b></button>
+    <button class="cp cp-idle" data-f="idle" aria-pressed="false" title="Filter: Claude is idle"><i class="d"></i>idle <b>0</b></button>
+    <button class="cp cp-busy" data-f="busy" aria-pressed="false" title="Filter: a command (not Claude) is running in the pane"><i class="d"></i>busy <b>0</b></button>
+    <button class="cp cp-other" data-f="other" aria-pressed="false" title="Filter: everything else"><i class="d"></i>other <b>0</b></button>
+  </div>
+  <div class="srow">
+    <input id="q" type="search" placeholder="search… ( / )" aria-label="Search sessions" autocomplete="off" spellcheck="false">
+    <button class="btn pri" id="gowait" disabled title="Jump to the session waiting for you (key: n)">Go to waiting</button>
+  </div>
+  <div id="nf" hidden>
+    <input id="nf-name" type="text" placeholder="session name" aria-label="Session name" autocomplete="off" spellcheck="false">
+    <input id="nf-cwd" type="text" placeholder="folder (empty = home)" aria-label="Folder" autocomplete="off" spellcheck="false">
+    <div id="nf-colors" class="sw-grid" role="group" aria-label="Pick a color"></div>
+    <div class="row">
+      <label class="ck"><input type="checkbox" id="nf-claude"> run claude</label>
+      <label class="ck"><input type="checkbox" id="nf-open" checked> open a tab</label>
+    </div>
+    <div class="row">
+      <button class="btn pri" type="button" id="nf-ok">Create</button>
+      <button class="btn" type="button" id="nf-no">Cancel</button>
+    </div>
+    <div class="err" id="nf-err"></div>
+  </div>
+  <div id="off" hidden></div>
+</header>
+
+<main id="list"></main>
+<div id="empty" hidden>No sessions</div>
+<section id="gone" hidden>
+  <button id="gone-h" type="button" aria-expanded="false" aria-controls="gone-list"
+          title="Claude sessions that are not running any more">Gone <b>0</b> <span class="dim">▸</span></button>
+  <ul id="gone-list" hidden></ul>
+</section>
+<div id="toasts" aria-live="polite"></div>
+
+<template id="tpl-card">
+  <article class="card" tabindex="0">
+    <i class="bar"></i>
+    <div class="main">
+      <div class="r1"><span class="nm"></span><span class="pill"></span><span class="age"></span><span class="mk"></span></div>
+      <div class="gauge" hidden><i></i></div>
+      <div class="r2"><span class="ctx" hidden></span><span class="mdl clip"></span><span class="proj clip"></span><span class="pth clip"></span></div>
+      <div class="det clip"></div>
+      <div class="ttl"></div>
+      <div class="bdg"></div>
+      <ul class="panes"></ul>
+    </div>
+    <div class="acts">
+      <button class="ic sw" data-a="color" title="Color" aria-label="Change color"></button>
+      <button class="ic" data-a="menu" title="More" aria-label="More actions">⋯</button>
+    </div>
+    <div class="pop" hidden></div>
+  </article>
+</template>
+
+<script nonce="__TM_NONCE__">
+'use strict';
+/* ========== helpers ========== */
+const $ = (s, r) => (r || document).querySelector(s);
+const el = (t, c, txt) => { const n = document.createElement(t); if (c) n.className = c;
+  if (txt != null) n.textContent = txt; return n; };
+const setTxt = (n, t) => { t = t == null ? '' : String(t); if (n.textContent !== t) n.textContent = t; };
+
+const TOKEN = $('meta[name=tm-token]').content;
+let PALETTE = {};
+try { PALETTE = JSON.parse($('meta[name=tm-palette]').content) || {}; } catch (e) { PALETTE = {}; }
+
+const LBL = { waiting:'waiting', working:'working', idle:'idle', busy:'busy', unknown:'?', stale:'stale', gone:'gone' };
+const OTHER = ['unknown', 'stale', 'gone', ''];
+
+function fmtAge(a){
+  if (a == null) return '';
+  a = Math.max(0, Math.round(a));
+  if (a < 60) return a + 's';
+  if (a < 3600) return Math.floor(a / 60) + 'm';
+  return Math.floor(a / 3600) + 'h' + String(Math.floor(a % 3600 / 60)).padStart(2, '0') + 'm';
+}
+const num = v => (typeof v === 'number' && isFinite(v)) ? v : null;
+const clampPct = p => Math.max(0, Math.min(100, p));
+function ctxTip(s){
+  // clamped like the bar: a server that reports 118% must not put 'context 118%' in the tooltip
+  const raw = num(s.ctx_pct), pct = raw === null ? null : clampPct(raw), cost = num(s.cost_usd);
+  return [pct === null ? '' : 'context ' + Math.round(pct) + '%', s.model || '',
+          cost === null ? '' : '$' + cost.toFixed(2)].filter(Boolean).join(' · ');
+}
+function shortPath(p){
+  if (!p) return '';
+  const s = p.split('/').filter(Boolean);
+  return (s.length > 2 ? '…/' : '/') + s.slice(-2).join('/');
+}
+function toast(msg, bad){
+  const t = el('div', 'toast' + (bad ? ' bad' : ''), msg);
+  $('#toasts').appendChild(t);
+  setTimeout(() => t.remove(), 2500);
+}
+
+/* ========== API calls (token on every request) ========== */
+let reloading = false;
+function reloadOnce(){
+  if (reloading) return;
+  const k = 'tm-reload', last = +(sessionStorage.getItem(k) || 0);
+  if (Date.now() - last < 8000) { toast('Token expired — please reopen this panel', 1); return; }
+  reloading = true; sessionStorage.setItem(k, String(Date.now())); location.reload();
+}
+async function api(path, body){
+  const o = { cache:'no-store', headers:{ 'X-TM-Token': TOKEN } };
+  if (body !== undefined) {
+    o.method = 'POST'; o.headers['Content-Type'] = 'application/json'; o.body = JSON.stringify(body);
+  }
+  const r = await fetch(path, o);
+  if (r.status === 403) { reloadOnce(); throw new Error('403'); }
+  let j = null;
+  try { j = await r.json(); } catch (e) { j = null; }
+  if (!j) throw new Error('HTTP ' + r.status);
+  return j;
+}
+async function act(path, body, okMsg){
+  let j;
+  try { j = await api(path, body); }
+  catch (e) { if (e.message !== '403') toast('Could not reach the server', 1); return null; }
+  if (j.ok) { if (okMsg || j.message) toast(okMsg || j.message); }
+  else toast(j.message || 'Something went wrong', 1);
+  refresh();
+  return j;
+}
+
+/* ========== poll loop ========== */
+let data = { sessions: [], counts: {} }, timer = null, backoff = 1500, online = null;
+const schedule = ms => { clearTimeout(timer); timer = setTimeout(poll, ms); };
+const refresh = () => schedule(80);
+
+function setOnline(v){
+  if (online === v) return;
+  online = v;
+  $('#live').classList.toggle('on', v);
+  $('#live').title = v ? 'live' : 'offline';
+  const d = $('#livedot'); setTxt(d, v ? '●' : '○'); d.title = v ? 'live' : 'offline';
+  $('#off').hidden = v;
+}
+async function poll(){
+  if (document.visibilityState === 'hidden') { schedule(1500); return; }   // hidden: idle along
+  try {
+    const j = await api('/api/state');
+    if (j.ok && j.data) { setOnline(true); data = j.data; render(); backoff = 1500; schedule(1500); }
+    else { setOnline(false); setTxt($('#off'), j.message || 'The server returned an error'); schedule(backoff = Math.min(Math.round(backoff * 1.5), 10000)); }
+  } catch (e) {
+    if (e.message === '403') {
+      if (reloading) return;                                                // a reload is genuinely under way
+      // the reload was refused (one happened < 8 s ago: the server restarted twice). Say so and retry
+      // instead of going quiet, or the poll loop dies while the header still claims to be live.
+      setOnline(false); setTxt($('#off'), 'Stale token (the server just restarted) — retrying in 5s'); schedule(5000); return;
+    }
+    setOnline(false);
+    setTxt($('#off'), 'Disconnected… retrying in ' + Math.round(backoff / 1000) + 's');
+    const wait = backoff;
+    backoff = Math.min(Math.round(backoff * 1.5), 10000);
+    schedule(wait);
+  }
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') { backoff = 1500; schedule(60); }
+});
+
+/* ========== filtering ========== */
+let filters = new Set(), query = '', visible = [];
+function pass(s){
+  if (filters.size) {
+    const g = OTHER.indexOf(s.state || '') >= 0 ? 'other' : s.state;
+    if (!filters.has(g)) return false;
+  }
+  if (query) {
+    const hay = ((s.name || '') + ' ' + (s.project || '') + ' ' + (s.title || '')).toLowerCase();
+    if (hay.indexOf(query) < 0) return false;
+  }
+  return true;
+}
+
+/* ========== session cards ========== */
+const cards = new Map();
+function mark(ch, tip){ const s = el('span', null, ch); s.title = tip; return s; }
+
+function updCard(c, s){
+  c.dataset.name = s.name;
+  const bar = c.querySelector('.bar');
+  bar.classList.toggle('none', !s.color);
+  if (s.color) bar.style.setProperty('--c', s.color); else bar.style.removeProperty('--c');
+
+  setTxt(c.querySelector('.nm'), s.name);
+  const pill = c.querySelector('.pill');
+  pill.hidden = !s.state;
+  pill.className = 'pill ' + (s.state || '');
+  // a busy pane shows the command itself ("make", "python"), which says more than the word "busy"
+  setTxt(pill, s.state ? (s.state === 'busy' ? (s.detail || LBL.busy) : (LBL[s.state] || s.state)) : '');
+  pill.title = s.state === 'busy' ? 'busy: ' + (s.detail || 'a command is running in the pane') + ' (no Claude here)' : (LBL[s.state] || s.state || '');
+  setTxt(c.querySelector('.age'), s.state ? fmtAge(s.age) : '');
+
+  const mk = c.querySelector('.mk'); mk.replaceChildren();
+  if (s.source === 'registry') mk.appendChild(mark('~', 'last known value from the registry, not from a hook'));
+  if (s.stale) mk.appendChild(mark('?', 'working or waiting for an unusually long time (over 30 minutes)'));
+
+  const pct = num(s.ctx_pct), tip = ctxTip(s);
+  const g = c.querySelector('.gauge'), ctx = c.querySelector('.ctx');
+  g.hidden = ctx.hidden = pct === null;
+  if (pct !== null) {
+    const p = clampPct(pct);
+    g.querySelector('i').style.width = p + '%';
+    g.classList.toggle('mid', p >= 60 && p < 85);
+    g.classList.toggle('hi', p >= 85);
+    ctx.className = 'ctx' + (p >= 85 ? ' hi' : p >= 60 ? ' mid' : '');
+    setTxt(ctx, Math.round(p) + '%');
+    g.title = ctx.title = tip;
+  }
+  const mdl = c.querySelector('.mdl');
+  setTxt(mdl, s.model || ''); mdl.hidden = !s.model; mdl.title = tip;
+
+  const r2 = c.querySelector('.r2');
+  setTxt(c.querySelector('.proj'), s.project || '');
+  setTxt(c.querySelector('.pth'), shortPath(s.path));
+  r2.hidden = !(s.project || s.path || s.model || pct !== null);
+  r2.title = s.path || '';
+
+  const det = c.querySelector('.det');
+  // a busy card already shows the command in its pill, so do not print it twice
+  const detail = s.state === 'busy' ? '' : (s.detail || '');
+  setTxt(det, detail); det.hidden = !detail; det.title = detail;
+  const ttl = c.querySelector('.ttl');
+  setTxt(ttl, s.title || ''); ttl.hidden = !s.title; ttl.title = s.title || '';
+
+  const bdg = c.querySelector('.bdg'); bdg.replaceChildren();
+  if (s.in_iterm2) bdg.appendChild(el('span', 'b', 'tab'));
+  else if (s.attached > 0) bdg.appendChild(el('span', 'b', s.attached === 1 ? 'ssh' : s.attached + ' clients'));
+  if (!s.attached) bdg.appendChild(el('span', 'b', 'detached'));
+
+  const ul = c.querySelector('.panes'); ul.replaceChildren();
+  const ps = (s.panes || []).filter(p => p.claude || p.state);
+  if (ps.length > 1) for (const p of ps) {
+    const li = el('li');
+    li.appendChild(el('i', 'dot ' + (p.state || '')));
+    const d = el('span', 'clip', p.detail || LBL[p.state] || '—');
+    d.title = (p.state === 'busy' ? 'busy: ' + (p.detail || 'command') + ' — ' : '') + (p.pane || '');
+    li.appendChild(d);
+    if (p.title) li.appendChild(el('span', 'clip dim', p.title));
+    ul.appendChild(li);
+  }
+
+  const sw = c.querySelector('.sw');
+  sw.classList.toggle('none', !s.color);
+  if (s.color) sw.style.setProperty('background-color', s.color); else sw.style.removeProperty('background-color');
+}
+
+function render(){
+  const c = data.counts || {};
+  const other = Math.max(0, (c.total || 0) - (c.waiting || 0) - (c.working || 0) - (c.idle || 0) - (c.busy || 0));
+  setTxt($('#pills [data-f=waiting] b'), c.waiting || 0);
+  setTxt($('#pills [data-f=working] b'), c.working || 0);
+  setTxt($('#pills [data-f=idle] b'), c.idle || 0);
+  setTxt($('#pills [data-f=busy] b'), c.busy || 0);
+  setTxt($('#pills [data-f=other] b'), other);
+
+  const it2 = data.iterm2 || {}, sv = data.server || {};
+  const noit2 = $('#noit2');
+  noit2.hidden = it2.available !== false;
+  if (it2.installed === false) {                       // no iTerm2 at all (e.g. the page opened over ssh)
+    setTxt(noit2, 'no iTerm2'); noit2.title = 'iTerm2 (it2) is not installed here: jumping to and opening tabs is unavailable';
+  } else {
+    setTxt(noit2, 'iTerm2 silent'); noit2.title = 'iTerm2 is not answering (it2 failed, or its Python API is off): jumping to a tab and opening one will fail';
+  }
+  if (sv.version) $('#brand').title = 'Kalmux v' + sv.version;
+  renderQuota(data.quota);
+
+  const gw = $('#gowait');
+  gw.disabled = !(c.waiting > 0);
+  gw.classList.toggle('hot', c.waiting > 0);
+
+  visible = (data.sessions || []).filter(pass);
+  const list = $('#list'), keep = new Set();
+  let i = 0;
+  for (const s of visible) {
+    let card = cards.get(s.name);
+    if (!card) { card = $('#tpl-card').content.firstElementChild.cloneNode(true); cards.set(s.name, card); }
+    updCard(card, s);
+    keep.add(s.name);
+    // moving a node drops focus (the rename input, a card being tabbed to): move only when out of place,
+    // and never while a popover is open
+    const at = list.children[i] || null;
+    if (!card.parentNode) list.insertBefore(card, at);
+    else if (!popCard && at !== card) list.insertBefore(card, at);
+    i++;
+  }
+  for (const [k, card] of cards) if (!keep.has(k)) { if (popCard === card) closePop(); card.remove(); cards.delete(k); }
+  $('#empty').hidden = visible.length > 0;
+  setTxt($('#empty'), (query || filters.size) ? 'No session matches' : 'No sessions');
+  renderGone(data.tombstones || []);
+}
+
+/* ========== quota chip ========== */
+// "resets in 3h 50m" beats a bare time of day: the toolbelt is read at a glance, and a 7d window
+// resets on another date entirely. Relative to data.now, so it matches the ages on the cards.
+function fmtUntil(secs){
+  if (secs === null) return '';
+  if (secs <= 0) return 'now';
+  const d = Math.floor(secs / 86400), h = Math.floor(secs % 86400 / 3600), m = Math.floor(secs % 3600 / 60);
+  if (d) return 'in ' + d + 'd ' + h + 'h';
+  if (h) return 'in ' + h + 'h ' + m + 'm';
+  return 'in ' + Math.max(1, m) + 'm';
+}
+function windowTip(w, label){
+  if (!w || num(w.used_pct) === null) return '';
+  const at = num(w.resets_at);
+  const when = at === null ? '' : ', resets ' + fmtUntil(Math.round(at - (num(data.now) || 0)));
+  return label + ' ' + Math.round(w.used_pct) + '%' + when;
+}
+function renderQuota(q){
+  const chip = $('#quota'), five = q && q.five_hour, pct = five ? num(five.used_pct) : null;
+  chip.hidden = pct === null;
+  if (pct === null) return;
+  setTxt(chip, 'quota ' + Math.round(pct) + '%');
+  chip.className = 'b' + (pct >= 85 ? ' hi' : pct >= 60 ? ' mid' : '');
+  chip.title = [windowTip(five, '5h'), windowTip(q.seven_day, '7d')].filter(Boolean).join(' · ');
+}
+
+/* ========== gone (tombstones) ========== */
+let goneOpen = false, goneSig = '', goneConfirm = '', goneFocus = '';
+function gbtn(txt, cls, fn){
+  const b = el('button', 'btn' + (cls ? ' ' + cls : ''), txt);
+  b.type = 'button'; b.addEventListener('click', fn); return b;
+}
+function arm(t, kind){ goneConfirm = kind ? t.session_id + ':' + kind : ''; goneFocus = t.session_id; render(); }
+function primary(b){ b.dataset.gp = '1'; return b; }      // the button renderGone puts the keyboard on
+function goneActions(li, t){
+  const kind = goneConfirm === t.session_id + ':resume' ? 'resume'
+             : goneConfirm === t.session_id + ':forget' ? 'forget' : '';
+  if (!kind) {
+    li.append(primary(gbtn('Resume', '', () => arm(t, 'resume'))),
+              gbtn('Forget', 'danger', () => arm(t, 'forget')));
+    return;
+  }
+  const go = () => { goneConfirm = ''; goneFocus = t.session_id; act('/api/' + kind, { session_id: t.session_id }); render(); };
+  // Cancel comes FIRST on purpose: the confirm button must never appear under the pointer that
+  // armed it, or one double-click resumes (or forgets) a session the user only meant to select.
+  li.append(el('span', 'dim', kind === 'resume' ? 'Start it again?' : 'Drop its trail?'),
+            gbtn('Cancel', '', () => arm(t, '')),
+            primary(gbtn(kind === 'resume' ? 'Resume' : 'Forget', kind === 'resume' ? 'pri' : 'danger', go)));
+}
+function goneMeta(t){
+  const age = num(t.last_ts) === null ? '' : fmtAge((data.now || 0) - t.last_ts);
+  return [t.project, age, t.last_message].filter(Boolean).join(' · ');
+}
+function goneRow(t){
+  const li = el('li', 'gi');
+  li.dataset.sid = t.session_id || '';
+  li.appendChild(el('span', 'gn', t.tmux_session || String(t.session_id || '').slice(0, 8)));
+  li.appendChild(el('span', 'pill ' + (t.ended === 'killed' ? 'gone' : 'idle'), t.ended || '?'));
+  const meta = el('span', 'gm clip', goneMeta(t));
+  meta.title = (t.session_id || '') + (t.cwd ? ' · ' + t.cwd : '');
+  li.appendChild(meta);
+  goneActions(li, t);
+  return li;
+}
+function renderGone(list){
+  const sec = $('#gone'), ul = $('#gone-list'), head = $('#gone-h');
+  sec.hidden = list.length === 0;
+  setTxt($('#gone-h b'), list.length);
+  head.setAttribute('aria-expanded', goneOpen ? 'true' : 'false');
+  setTxt(head.querySelector('span'), goneOpen ? '▾' : '▸');
+  ul.hidden = !goneOpen || list.length === 0;
+  const sig = list.map(t => [t.session_id, t.ended, t.last_ts, t.tmux_session].join(':')).join('|') + goneOpen + goneConfirm;
+  if (sig !== goneSig) {                        // rebuilding on every poll would kill an open confirm
+    goneSig = sig;
+    ul.replaceChildren();
+    if (goneOpen) for (const t of list) ul.appendChild(goneRow(t));
+    focusGone(ul);                              // a rebuilt row must not drop the keyboard on the floor
+  }
+  if (!goneOpen) return;
+  // the structural cache above ignores the age (it ticks with data.now), the project and the last
+  // message: refresh that text on every render, the row order is unchanged while the sig holds.
+  for (let i = 0; i < ul.children.length && i < list.length; i++) {
+    const m = ul.children[i].querySelector('.gm');
+    if (!m) continue;
+    setTxt(m, goneMeta(list[i]));
+    m.title = (list[i].session_id || '') + (list[i].cwd ? ' · ' + list[i].cwd : '');
+  }
+}
+function focusGone(ul){
+  if (!goneFocus) return;
+  const row = Array.from(ul.children).find(li => li.dataset.sid === goneFocus);
+  goneFocus = '';
+  const b = row && row.querySelector('[data-gp]');
+  if (b) b.focus();
+}
+$('#gone-h').addEventListener('click', () => { goneOpen = !goneOpen; goneConfirm = ''; render(); });
+
+/* ========== popovers: color / menu ========== */
+let popCard = null;
+function closePop(){
+  if (!popCard) return;
+  const p = popCard.querySelector('.pop');
+  p.hidden = true; p.replaceChildren(); p.dataset.k = '';
+  popCard = null;
+}
+function openPop(card, kind, name){
+  const same = popCard === card && card.querySelector('.pop').dataset.k === kind;
+  closePop();
+  if (same) return;
+  const p = card.querySelector('.pop');
+  p.dataset.k = kind; p.hidden = false; popCard = card;
+  if (kind === 'color') colorPop(p, name); else menuPop(p, name);
+}
+function colorPop(p, name){
+  p.appendChild(el('div', 'ph', 'Color'));
+  const g = el('div', 'sw-grid');
+  for (const k of Object.keys(PALETTE)) {
+    const b = el('button', 'sw'); b.type = 'button'; b.title = k; b.setAttribute('aria-label', 'Color ' + k);
+    b.style.setProperty('background-color', PALETTE[k]);
+    b.addEventListener('click', () => { closePop(); act('/api/color', { session: name, color: k }); });
+    g.appendChild(b);
+  }
+  p.appendChild(g);
+  p.appendChild(hexRow(p, name));
+  const none = el('button', 'mi', 'Clear color'); none.type = 'button';
+  none.addEventListener('click', () => { closePop(); act('/api/color', { session: name, color: 'none' }); });
+  p.appendChild(none);
+}
+function hexRow(p, name){
+  const row = el('div', 'row');
+  const i = document.createElement('input');
+  i.type = 'text'; i.placeholder = '#rrggbb'; i.spellcheck = false; i.maxLength = 7;
+  i.setAttribute('aria-label', 'Custom hex color');
+  i.style.flex = '1 1 80px';
+  const ok = el('button', 'btn', 'Apply'); ok.type = 'button';
+  const apply = () => {
+    const v = i.value.trim().replace(/^#?/, '#');
+    if (!/^#[0-9a-fA-F]{6}$/.test(v)) { i.setAttribute('aria-invalid', 'true'); i.focus(); return; }
+    closePop(); act('/api/color', { session: name, color: v });
+  };
+  i.addEventListener('input', () => i.removeAttribute('aria-invalid'));
+  i.addEventListener('keydown', e => { if (e.key === 'Enter') apply(); });
+  ok.addEventListener('click', apply);
+  row.append(i, ok);
+  return row;
+}
+function menuPop(p, name){
+  const add = (txt, cls, fn) => {
+    const b = el('button', 'mi' + (cls ? ' ' + cls : ''), txt);
+    b.type = 'button'; b.addEventListener('click', fn); p.appendChild(b);
+  };
+  add('Open a new tab', null, () => { closePop(); act('/api/open', { session: name }); });
+  add('Rename', null, () => renamePop(p, name));
+  add('Detach clients', null, () => { closePop(); act('/api/detach', { session: name }); });
+  add('Copy attach command', null, () => { closePop(); copyCmd(name); });
+  add('Kill', 'danger', () => killPop(p, name));
+}
+function renamePop(p, name){
+  p.replaceChildren();
+  p.appendChild(el('div', 'ph', 'New name'));
+  const i = document.createElement('input');
+  i.type = 'text'; i.value = name; i.spellcheck = false; i.setAttribute('aria-label', 'New name');
+  p.appendChild(i);
+  const row = el('div', 'row');
+  const ok = el('button', 'btn pri', 'Save'), no = el('button', 'btn', 'Cancel');
+  ok.type = no.type = 'button';
+  const save = () => { const v = i.value.trim(); closePop(); if (v && v !== name) act('/api/rename', { session: name, name: v }); };
+  ok.addEventListener('click', save);
+  no.addEventListener('click', closePop);
+  i.addEventListener('keydown', e => { if (e.key === 'Enter') save(); });
+  row.append(ok, no); p.appendChild(row);
+  i.focus(); i.select();
+}
+function killPop(p, name){
+  p.replaceChildren();
+  p.appendChild(el('div', 'ph danger', 'Kill it?'));
+  const row = el('div', 'row');
+  const y = el('button', 'btn danger', 'Kill'), n = el('button', 'btn', 'Cancel');
+  y.type = n.type = 'button';
+  y.addEventListener('click', () => { closePop(); act('/api/kill', { session: name }); });
+  n.addEventListener('click', closePop);
+  row.append(y, n); p.appendChild(row); y.focus();
+}
+async function copyCmd(name){
+  const txt = 'tmux attach -t ' + name;
+  try { await navigator.clipboard.writeText(txt); toast('Copied: ' + txt); return; }
+  catch (e) { /* WKWebView can block the clipboard API: fall back to a textarea */ }
+  const ta = document.createElement('textarea');
+  ta.value = txt; document.body.appendChild(ta); ta.select();
+  let done = false;
+  try { done = document.execCommand('copy'); } catch (e) { done = false; }
+  ta.remove();
+  toast(done ? 'Copied: ' + txt : 'Could not copy, type it yourself: ' + txt, !done);
+}
+
+/* ========== events ========== */
+$('#list').addEventListener('click', e => {
+  const card = e.target.closest('.card');
+  if (!card) return;
+  if (e.target.closest('.pop')) return;                 // clicks inside a popover belong to it
+  const b = e.target.closest('button[data-a]');
+  if (b) { e.stopPropagation(); openPop(card, b.dataset.a, card.dataset.name); return; }
+  closePop();
+  act('/api/go', { session: card.dataset.name });
+});
+$('#list').addEventListener('keydown', e => {
+  const card = e.target.closest('.card');
+  if (card && card === e.target && (e.key === 'Enter' || e.key === ' ')) {
+    e.preventDefault(); act('/api/go', { session: card.dataset.name });
+  }
+});
+// capture phase: the target is still in the DOM here (a menu item is replaced as soon as it is clicked)
+document.addEventListener('click', e => {
+  if (!popCard || e.target.closest('.pop') || e.target.closest('button[data-a]')) return;
+  const onCard = !!e.target.closest('.card');
+  closePop();
+  if (onCard) { e.stopPropagation(); e.preventDefault(); }   // clicking the card to dismiss the menu only dismisses
+}, true);
+$('#pills').addEventListener('click', e => {
+  const b = e.target.closest('.cp'); if (!b) return;
+  const f = b.dataset.f;
+  if (filters.has(f)) filters.delete(f); else filters.add(f);
+  b.setAttribute('aria-pressed', filters.has(f) ? 'true' : 'false');
+  render();
+});
+$('#q').addEventListener('input', e => { query = e.target.value.trim().toLowerCase(); render(); });
+$('#gowait').addEventListener('click', () => act('/api/next-waiting', {}));
+$('#add').addEventListener('click', () => {
+  const nf = $('#nf'); nf.hidden = !nf.hidden;
+  if (!nf.hidden) $('#nf-name').focus();
+});
+$('#nf-no').addEventListener('click', () => { $('#nf').hidden = true; });
+$('#nf-ok').addEventListener('click', createSession);
+for (const id of ['#nf-name', '#nf-cwd']) {
+  $(id).addEventListener('keydown', e => { if (e.key === 'Enter') createSession(); });
+  $(id).addEventListener('input', () => setTxt($('#nf-err'), ''));
+}
+
+let nfColor = 'none';
+(function buildNfColors(){
+  const g = $('#nf-colors');
+  const mk = (name, cls, tip) => {
+    const b = el('button', 'sw' + (cls ? ' ' + cls : '')); b.type = 'button';
+    b.title = tip; b.setAttribute('aria-label', tip);
+    b.setAttribute('aria-pressed', name === nfColor ? 'true' : 'false');
+    if (PALETTE[name]) b.style.setProperty('background-color', PALETTE[name]);
+    b.addEventListener('click', () => {
+      nfColor = name;
+      for (const o of g.children) o.setAttribute('aria-pressed', o === b ? 'true' : 'false');
+    });
+    g.appendChild(b);
+  };
+  mk('none', 'none', 'no color');
+  for (const k of Object.keys(PALETTE)) mk(k, null, k);
+})();
+
+async function createSession(){
+  const name = $('#nf-name').value.trim(), err = $('#nf-err');
+  if (!/^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}$/.test(name)) { setTxt(err, 'Name must start with a letter, digit or _, then letters, digits, _ and - (max 64)'); return; }
+  setTxt(err, '');
+  const j = await act('/api/new', {
+    name: name, cwd: $('#nf-cwd').value.trim(), color: nfColor,
+    start_claude: $('#nf-claude').checked, open: $('#nf-open').checked
+  });
+  if (j && j.ok) {
+    $('#nf-name').value = ''; $('#nf-cwd').value = ''; $('#nf').hidden = true;
+    const o = j.data && j.data.open;                  // the session exists; the tab may still have failed
+    if (o && !o.ok) toast(o.message || 'Session created, but no tab could be opened', 1);
+  }
+  else if (j) setTxt(err, j.message || '');
+}
+
+document.addEventListener('keydown', e => {
+  const t = e.target, isField = n => !!n && (n.tagName === 'INPUT' || n.tagName === 'TEXTAREA');
+  const typing = isField(t) || isField(document.activeElement);
+  if (e.key === 'Escape') {
+    if (popCard) closePop();
+    else if (goneConfirm) { goneConfirm = ''; render(); }
+    else if (!$('#nf').hidden) $('#nf').hidden = true;
+    else if (typing) t.blur();
+    return;
+  }
+  // popover open or a Gone confirm armed: shortcuts off, so a stray '1' cannot fire a go behind a dialog
+  if (typing || popCard || goneConfirm || e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.key === '/') { e.preventDefault(); const q = $('#q'); q.focus(); q.select(); return; }
+  if (e.key === 'n') { e.preventDefault(); if (!$('#gowait').disabled) act('/api/next-waiting', {}); return; }
+  if (e.key >= '1' && e.key <= '9') {
+    const s = visible[+e.key - 1];
+    if (s) { e.preventDefault(); closePop(); act('/api/go', { session: s.name }); }
+  }
+});
+
+setOnline(false);
+poll();
+</script>
+</body>
+</html>

@@ -1,0 +1,188 @@
+#!/bin/bash
+# cc-status-tmux — Claude Code hook -> tmux user options + iTerm2 Session Status.
+#
+# Why: iTerm2 3.7's bundled `cc-status` targets the iTerm2 session named by ITERM_SESSION_ID.
+# Inside tmux every pane inherits the SAME stale value (the first control-mode gateway), so all
+# Claude sessions report their status to one hidden tab. This wrapper fixes that by:
+#   1. writing the state into tmux user options on the pane (@cc_state, @cc_detail, @cc_since,
+#      @cc_event) — readable by `tm ls`, the tmux status line and any remote attach;
+#   2. writing iTerm2 escape sequences (OSC 21337 status, OSC 1337 SetUserVar, OSC 6 tab color)
+#      straight into the pane's tty — they pass through tmux -CC and land on the right session.
+# Outside tmux it delegates to the original cc-status unchanged.
+# Contract: never block, never fail — a hook must not slow down or break Claude Code.
+#
+# The tty write is rare on purpose (phase 4): only a state change, a clear, or an event the user
+# must see (PermissionRequest / Notification / Stop / StopFailure / AskUserQuestion) reaches the
+# screen. A tool call while already working updates tmux options only — no escape sequence, no
+# jitter. Lifecycle events also append one JSON line to the session's trail, which is what
+# `kalmux dead` / `kalmux resume` read after a session is gone.
+set -u
+export LC_ALL=en_US.UTF-8   # unconditional: bash substring/tr must count characters, not bytes
+
+ORIG="${CC_STATUS_ORIG:-/Applications/iTerm.app/Contents/Resources/utilities/cc-status}"
+MAX_DETAIL=120
+MAX_TRAIL=200                           # cap for the free text stored in a trail line
+MAX_FIELD=1000                          # cap applied by jq to every extracted field (see below)
+STALE_SESSION_START_SOURCES="compact"   # SessionStart(source=compact) fires mid-turn: keep the live state
+COLOR_WORKING='#ff9500'
+COLOR_WAITING='#5f87ff'
+COLOR_IDLE_DOT='#00d75f'
+COLOR_IDLE_TEXT='#888888'
+US=$'\x1f'
+H2='[0-9a-f][0-9a-f]'                   # bash 3.2 has no reliable quoted =~; match the UUID with a glob
+UUID_GLOB="$H2$H2$H2$H2-$H2$H2-$H2$H2-$H2$H2-$H2$H2$H2$H2$H2$H2"
+
+# Read ALL of stdin: a truncated payload is invalid JSON, so jq would drop the whole event (a long
+# last_assistant_message is trimmed later by sanitize, never by cutting the JSON in half).
+input="$(cat 2>/dev/null)" || input=""
+
+# --- outside tmux: keep iTerm2's native behaviour ------------------------------------------
+if [ -z "${TMUX_PANE:-}" ]; then
+  if [ -x "$ORIG" ]; then printf '%s' "$input" | "$ORIG" "$@" 2>/dev/null; fi
+  exit 0
+fi
+
+command -v jq >/dev/null 2>&1 || exit 0
+command -v tmux >/dev/null 2>&1 || exit 0
+[ -n "$input" ] || exit 0
+
+# --- parse the hook JSON once (every field total; control chars stripped; joined by \x1f) ----
+# Each field is cut to MAX_FIELD characters INSIDE jq: the JSON itself is never truncated (that would
+# make it unparseable), but bash 3.2 string ops are quadratic, and a 300 KB assistant message would
+# otherwise stall the hook for seconds. Everything kept is far longer than MAX_DETAIL / MAX_TRAIL.
+parsed="$(printf '%s' "$input" | jq -r --argjson max "$MAX_FIELD" '
+  def s(f): (try f catch null) // "" | tostring | .[0:$max] | gsub("[[:cntrl:]]"; " ");
+  [ s(.hook_event_name), s(.notification_type), s(.tool_name), s(.message),
+    s(.last_assistant_message), s(.tool_input.questions[0].question), s(.error),
+    s(.session_id), s(.cwd), s(.source), s(.reason) ] | join("")' 2>/dev/null)" || exit 0
+[ -n "$parsed" ] || exit 0
+IFS="$US" read -r event ntype tool message last_msg question error session_id cwd source reason <<<"$parsed"
+
+# --- sanitize free text for tmux options and OSC payloads ----------------------------------
+sanitize() {
+  local s="$1" limit="${2:-$MAX_DETAIL}"
+  s="${s//;/,}"
+  s="$(printf '%s' "$s" | tr -s '[:space:]' ' ')"
+  s="${s# }"; s="${s% }"
+  printf '%s' "${s:0:$limit}"
+}
+
+# --- trail: one JSON line per lifecycle event, in ${KALMUX_STATE_DIR}/trace/<session_id>.jsonl
+# Best effort by contract: a failure here must never surface to Claude Code.
+append_trail() {
+  local key="$1" value="$2" dir line
+  case "$session_id" in $UUID_GLOB) ;; *) return 0 ;; esac
+  dir="${KALMUX_STATE_DIR:-${HOME:-}/.local/state/kalmux}/trace"
+  [ -d "$dir" ] || mkdir -p -m 700 "$dir" 2>/dev/null || return 0
+  line="$(jq -c -n --arg ts "$now" --arg event "$event" --arg session_id "$session_id" \
+      --arg tmux_session "$tmux_session" --arg pane "$P" --arg cwd "$cwd" --arg color "$tm_color" \
+      --arg key "$key" --arg value "$value" \
+      '{ts: ($ts | tonumber), event: $event, session_id: $session_id, tmux_session: $tmux_session,
+        pane: $pane, cwd: $cwd, color: $color} + {($key): $value}' 2>/dev/null)" || return 0
+  [ -n "$line" ] || return 0
+  printf '%s\n' "$line" 2>/dev/null >> "$dir/$session_id.jsonl"   # 2> first: silence a failed >>
+  return 0
+}
+
+# --- event -> state (mirrors iTerm2's cc-status, plus AskUserQuestion awareness) ------------
+state=""; detail=""; clear=0
+case "$event" in
+  UserPromptSubmit) state=working ;;
+  PreToolUse)
+    if [ "$tool" = "AskUserQuestion" ]; then state=waiting; detail="$(sanitize "$question")"
+    else state=working; detail="$(sanitize "$tool")"; fi ;;
+  PostToolUse) state=working; detail="$(sanitize "$tool")" ;;
+  PermissionRequest)
+    state=waiting
+    if [ "$tool" = "ExitPlanMode" ]; then detail="Review proposed plan?"
+    else detail="Allow $(sanitize "${tool:-tool}")?"; fi ;;
+  Notification)
+    case "$ntype" in
+      idle_prompt) state=idle ;;
+      *) state=waiting; detail="$(sanitize "$message")" ;;
+    esac ;;
+  Stop) state=idle; detail="✓ $(sanitize "$last_msg")"; detail="${detail% }" ;;
+  StopFailure) state=idle; detail="✗ $(sanitize "$error")"; detail="${detail% }" ;;
+  SessionStart)
+    case " $STALE_SESSION_START_SOURCES " in *" $source "*) exit 0 ;; esac
+    state=idle ;;
+  SessionEnd) clear=1 ;;
+  *) exit 0 ;;
+esac
+
+# --- 1+2) ONE tmux invocation: read the pane, THEN write the new state -----------------------
+# The read (pane tty, client, color, PREVIOUS state, session name) and the write must not be two
+# separate invocations: two hook runs racing on the same pane would then both see the old
+# @cc_state, both conclude "the state changed" and both write the tty. tmux executes one client
+# command list as a unit, so `display -p ... \; set ...` prints the value from BEFORE the write.
+P="$TMUX_PANE"
+now="$(date +%s)"
+cmd=(display -p -t "$P" "#{pane_tty}${US}#{session_attached}${US}#{@tm_color}${US}#{@cc_state}${US}#{session_name}")
+if [ "$clear" = 1 ]; then
+  for opt in @cc_state @cc_since @cc_event @cc_session_id @cc_cwd @cc_detail; do
+    cmd+=(";" set -p -t "$P" -u "$opt")
+  done
+else
+  cmd+=(";" set -p -t "$P" @cc_state "$state" ";" set -p -t "$P" @cc_since "$now" \
+        ";" set -p -t "$P" @cc_event "$event" ";" set -p -t "$P" @cc_detail "$detail")
+  if [ "$event" = "SessionStart" ]; then
+    cmd+=(";" set -p -t "$P" @cc_session_id "$(sanitize "$session_id")" \
+          ";" set -p -t "$P" @cc_cwd "$(sanitize "$cwd")")
+  fi
+fi
+info="$(tmux "${cmd[@]}" 2>/dev/null)" || info=""
+IFS="$US" read -r tty attached tm_color prev_state tmux_session <<<"$info"
+
+# --- 3) the trail (lifecycle events only) ---------------------------------------------------
+case "$event" in
+  SessionStart) append_trail source "$(sanitize "$source" $MAX_TRAIL)" ;;
+  SessionEnd)   append_trail reason "$(sanitize "$reason" $MAX_TRAIL)" ;;
+  Stop)         append_trail detail "$(sanitize "$last_msg" $MAX_TRAIL)" ;;
+  StopFailure)  append_trail detail "$(sanitize "$error" $MAX_TRAIL)" ;;
+esac
+
+# --- 4) should the pane tty be touched at all? ----------------------------------------------
+# Writing on every tool call jitters the screen for no gain: the state is already in tmux.
+write=0
+[ "$clear" = 1 ] && write=1
+[ "$state" != "$prev_state" ] && write=1
+case "$event" in PermissionRequest|Notification|Stop|StopFailure) write=1 ;; esac
+if [ "$event" = "PreToolUse" ] && [ "$tool" = "AskUserQuestion" ]; then write=1; fi
+[ "$write" = 1 ] || exit 0
+
+# --- 5) iTerm2 escape sequences into the pane tty -------------------------------------------
+[ -n "$tty" ] && [ -w "$tty" ] || exit 0
+[ "${attached:-0}" != "0" ] || exit 0   # no client is looking at this session; skip the pty write
+
+b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
+
+# A leading ST closes any string a previously truncated write may have left open.
+seq="$(printf '\033\\')"
+if [ "$clear" = 1 ]; then
+  seq="$seq$(printf '\033]21337;status=;indicator=;status-color=;detail=\033\\\033]1337;SetUserVar=cc_state=\007')"
+else
+  case "$state" in
+    working) dot="$COLOR_WORKING"; text="$COLOR_WORKING" ;;
+    waiting) dot="$COLOR_WAITING"; text="$COLOR_WAITING" ;;
+    *)       dot="$COLOR_IDLE_DOT"; text="$COLOR_IDLE_TEXT" ;;
+  esac
+  # the tool name is tmux-only: iTerm2 shows a bare "working", like its own hook does
+  osc_detail="$detail"; [ "$state" = "working" ] && osc_detail=""
+  seq="$seq$(printf '\033]21337;status=%s;indicator=%s;status-color=%s;detail=%s\033\\\033]1337;SetUserVar=cc_state=%s\007' \
+        "$state" "$dot" "$text" "$osc_detail" "$(b64 "$state")")"
+fi
+
+# re-apply the session's identity color so it survives detach/reattach (set by `kalmux color`)
+hex="${tm_color#\#}"
+if [ ${#hex} -eq 6 ] && [ -z "${hex//[0-9a-fA-F]/}" ]; then
+  r=$((16#${hex:0:2})); g=$((16#${hex:2:2})); b=$((16#${hex:4:2}))
+  seq="$seq$(printf '\033]6;1;bg;red;brightness;%d\007\033]6;1;bg;green;brightness;%d\007\033]6;1;bg;blue;brightness;%d\007' "$r" "$g" "$b")"
+fi
+
+# Non-blocking, best-effort write: a paused control-mode client can stop draining the pty and a
+# plain redirect would then hang this hook (and Claude) indefinitely.
+if command -v perl >/dev/null 2>&1; then
+  perl -e 'use Fcntl; my ($t, $d) = @ARGV; sysopen(my $fh, $t, O_WRONLY | O_NONBLOCK) or exit 0;
+           binmode $fh; syswrite($fh, $d); close $fh;' "$tty" "$seq" 2>/dev/null
+fi
+exit 0
