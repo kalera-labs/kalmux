@@ -3,7 +3,6 @@ The release workflow compares the tag against pyproject only, so this is what ke
 import tomllib
 
 from conftest import ROOT
-
 from kalmux import tmcore
 
 

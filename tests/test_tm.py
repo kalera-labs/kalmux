@@ -455,10 +455,16 @@ def test_main_with_fake_bins(tm, fake_bins, monkeypatch, capsys):
     assert tm.main(["kill", "api"]) == 0 and tm.main(["detach", "api"]) == 0 and tm.main(["rename", "api", "g2"]) == 0
     assert tm.main(["reapply"]) == 0 and "status=working" in fake_bins["read"]()
     if os.uname().sysname == "Darwin":
+        monkeypatch.setenv("TERM_PROGRAM", "iTerm.app")            # the desk: go drives iTerm2
         assert tm.main(["go", "api"]) == 0
         assert "it2 session focus G-2" in fake_bins["log"].read_text()
         assert tm.main(["open", "api"]) == 0
         assert 'it2 tab new --window pty-FAKE --command /bin/zsh -lc \'exec tmux -CC attach -t "=api"\'; exit' in fake_bins["log"].read_text()
+    for var in ("TERM_PROGRAM", "LC_TERMINAL", "TMUX"):            # a phone over ssh: go attaches here
+        monkeypatch.delenv(var, raising=False)
+    before = fake_bins["log"].read_text()
+    assert tm.main(["go", "api"]) == 0
+    assert "tmux attach -t api" in capsys.readouterr().out and "focus" not in fake_bins["log"].read_text()[len(before):]
     assert tm.main(["new", "brand-new", "--cwd", "/tmp", "--color", "blue", "--no-attach"]) == 0
     assert tm.main(["new", "api", "--no-attach"]) == 1
     assert tm.main(["rename", "api", "bad.name"]) == 1
