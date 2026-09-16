@@ -40,6 +40,7 @@ from .tmcore import (
     Tmux,
     attach_command,
     fmt_age,
+    in_iterm2,
     load_registry,
     load_status,
     load_trails,
@@ -115,11 +116,17 @@ def cmd_new(tmux: Tmux, name: str, cwd: str | None, color: str | None, attach: b
     return 0
 
 
-def cmd_go(tmux: Tmux, it2: It2, query: str) -> int:
-    """`kalmux go <anything>`: an exact session name, or part of a name, project or Claude title."""
+def cmd_go(tmux: Tmux, it2: It2, query: str, do_exec: bool = True) -> int:
+    """`kalmux go <anything>`: an exact session name, or part of a name, project or Claude title.
+
+    In an iTerm2 window this focuses (or opens) the session's tab. Anywhere else, `ssh mac kalmux go api`
+    from a phone included, the it2 binary on the Mac would only move tabs at home, so `go` attaches right
+    here instead, with the same verb `attach` picks for this terminal."""
     found = resolve_session(merge(tmux.list_panes(), {}, int(time.time())), query)
     if not found.ok:
         return _report(found)
+    if not in_iterm2(os.environ):
+        return cmd_attach(tmux, found.data["session"], do_exec=do_exec)
     return _report(action_go(tmux, it2, TabMap(it2), found.data["session"]))
 
 

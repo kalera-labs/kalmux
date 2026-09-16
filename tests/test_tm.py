@@ -139,8 +139,10 @@ def test_valid_session_name(tm):
         assert not tmcore.valid_session_name(bad)
     with pytest.raises(ValueError):
         tmcore.cc_tab_command("bad name")
-    # the target stays quoted: a bare =ok is zsh EQUALS expansion ("ok not found"), and the tab never attaches
-    assert tmcore.cc_tab_command("ok") == """/bin/zsh -lc 'exec tmux -CC attach -t "=ok"'"""
+    # the target stays quoted: a bare =ok is zsh EQUALS expansion ("ok not found"), and the tab never attaches.
+    # `it2 tab new --command` types the line into the tab's login shell, so the trailing `exit` is what closes
+    # the tab once tmux leaves (kill, detach, server gone); without it the tab lives on as a bare shell prompt.
+    assert tmcore.cc_tab_command("ok") == """/bin/zsh -lc 'exec tmux -CC attach -t "=ok"'; exit"""
 
 
 # ---------- registry ----------
@@ -267,6 +269,11 @@ def test_attach_command_picks_the_right_verb(tm):
     assert tm.attach_command("x", {"TERM_PROGRAM": "iTerm.app"}) == ["tmux", "-CC", "attach", "-t", "x"]
     assert tm.attach_command("x", {"LC_TERMINAL": "iTerm2"}) == ["tmux", "-CC", "attach", "-t", "x"]
     assert tm.attach_command("x", {}) == ["tmux", "attach", "-t", "x"]
+    # inside a tmux pane iTerm2's own TERM_PROGRAM is gone (tmux sets its own) but LC_TERMINAL survives
+    assert tmcore.in_iterm2({"TERM_PROGRAM": "tmux", "LC_TERMINAL": "iTerm2", "TMUX": "/tmp/x"})
+    assert tmcore.in_iterm2({"TERM_PROGRAM": "iTerm.app"})
+    assert not tmcore.in_iterm2({"SSH_CONNECTION": "1.2.3.4 5 6.7.8.9 22", "TERM_PROGRAM": "BlinkShell"})
+    assert not tmcore.in_iterm2({})
 
 
 def test_write_tty_failure_returns_false(tm):
@@ -451,7 +458,7 @@ def test_main_with_fake_bins(tm, fake_bins, monkeypatch, capsys):
         assert tm.main(["go", "api"]) == 0
         assert "it2 session focus G-2" in fake_bins["log"].read_text()
         assert tm.main(["open", "api"]) == 0
-        assert 'it2 tab new --window pty-FAKE --command /bin/zsh -lc \'exec tmux -CC attach -t "=api"\'' in fake_bins["log"].read_text()
+        assert 'it2 tab new --window pty-FAKE --command /bin/zsh -lc \'exec tmux -CC attach -t "=api"\'; exit' in fake_bins["log"].read_text()
     assert tm.main(["new", "brand-new", "--cwd", "/tmp", "--color", "blue", "--no-attach"]) == 0
     assert tm.main(["new", "api", "--no-attach"]) == 1
     assert tm.main(["rename", "api", "bad.name"]) == 1
@@ -812,13 +819,28 @@ def test_cmd_new_types_the_configured_claude_command(tm, capsys):
     capsys.readouterr()
 
 
-def test_cmd_go_resolves_a_topic_to_a_session(tm, capsys):
+def test_cmd_go_resolves_a_topic_to_a_session(tm, capsys, monkeypatch):
+    monkeypatch.setattr(tm.os, "environ", {"TERM_PROGRAM": "iTerm.app"})
     t = FakeTmux(panes=[pane("api", title="✳ Phase 2", path="/x/api-svc"),
                         pane("notes", pane_id="%2", window_id="@2", title="✳ groceries", path="/x/notes")])
     it2 = FakeIt2(rows=[it2_row("G1"), it2_row("G2")], panes={"G1": "1", "G2": "2"})
     assert tm.cmd_go(t, it2, "phase") == 0 and it2.focused == ["G1"]
     assert tm.cmd_go(t, it2, "notes") == 0 and it2.focused[-1] == "G2"
     assert tm.cmd_go(t, it2, "zzz") == 1 and "no session" in capsys.readouterr().err
+
+
+def test_cmd_go_off_the_desk_attaches_here_instead_of_driving_iterm2(tm, capsys, monkeypatch):
+    """`ssh mac kalmux go api` from a phone: the it2 binary exists on the Mac, but focusing a tab at home helps
+    nobody. Away from iTerm2 `go` behaves like `attach` (plain attach over SSH, switch-client inside tmux)."""
+    t = FakeTmux(panes=[pane("api", title="✳ Phase 2", path="/x/api-svc")])
+    it2 = FakeIt2(rows=[it2_row("G1")], panes={"G1": "1"})
+    monkeypatch.setattr(tm.os, "environ", {"SSH_CONNECTION": "1.2.3.4 5 6.7.8.9 22", "TERM_PROGRAM": "BlinkShell"})
+    assert tm.cmd_go(t, it2, "phase", do_exec=False) == 0
+    assert "tmux attach -t api" in capsys.readouterr().out and it2.focused == [] and it2.tabs == []
+    monkeypatch.setattr(tm.os, "environ", {"TMUX": "/tmp/x", "SSH_TTY": "/dev/pts/1"})
+    assert tm.cmd_go(t, it2, "api", do_exec=False) == 0
+    assert "tmux switch-client -t api" in capsys.readouterr().out and it2.focused == []
+    assert tm.cmd_go(t, it2, "zzz", do_exec=False) == 1 and "no session" in capsys.readouterr().err
 
 
 def test_cmd_dead_lists_tombstones_and_hides_superseded(tm, tmp_path, capsys):

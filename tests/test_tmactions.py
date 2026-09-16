@@ -165,7 +165,7 @@ def test_action_go_opens_a_tab_when_session_has_none():
     it2 = FakeIt2(rows=[], window="pty-CUR")
     r = ta.action_go(tmux, it2, ta.TabMap(it2), "api")
     assert r.ok and r.data["opened"] is True
-    assert it2.tabs == [("""/bin/zsh -lc 'exec tmux -CC attach -t "=api"'""", "pty-CUR")]
+    assert it2.tabs == [("""/bin/zsh -lc 'exec tmux -CC attach -t "=api"'; exit""", "pty-CUR")]
 
 
 def test_action_go_refuses_to_open_while_it2_is_down():
@@ -207,7 +207,7 @@ def test_action_open_falls_back_when_iterm2_has_no_current_window():
     assert r.ok and r.data["window"] == "pty-FRONT" and it2.tabs[-1][1] == "pty-FRONT"
     it2.windows = []
     r = ta.action_open(tmux, it2, "ok")
-    assert r.ok and "new window" in r.message and it2.new_windows == ["""/bin/zsh -lc 'exec tmux -CC attach -t "=ok"'"""]
+    assert r.ok and "new window" in r.message and it2.new_windows == ["""/bin/zsh -lc 'exec tmux -CC attach -t "=ok"'; exit"""]
     it2.fail_tab = True
     assert "window new failed" in ta.action_open(tmux, it2, "ok").message
 

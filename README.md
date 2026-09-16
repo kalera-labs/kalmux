@@ -94,8 +94,8 @@ Then open the toolbelt: **View > Toolbelt** (⇧⌘B) and pick **Kalmux**. Reatt
 
 ```
 kalmux ls [--json]            every session with project, Claude state, context %, age, title, color
-kalmux go <topic>             focus a session by name, or by part of its project or Claude title
-kalmux open <session>         open the session as a new control-mode tab in the current window
+kalmux go <topic>             focus a session by name, or by part of its project or Claude title; over SSH it attaches here
+kalmux open <session>         open the session as a new control-mode tab in the current window (closes with the session)
 kalmux color <session> <c>    identity color: #rrggbb, one of 20 palette names, or none
 kalmux new <name> [--cwd D] [--color C] [--claude] [--no-attach]
 kalmux kill | detach <session>        kalmux rename <session> <new>

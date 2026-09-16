@@ -687,21 +687,34 @@ def resumable_trails(trace_dir: Path, registry: dict, now: int, keep_days: int =
 
 
 # ----------------------------------------------------------------------------- attach helpers
+def in_iterm2(env) -> bool:
+    """Is this terminal an iTerm2 window? TERM_PROGRAM is iTerm2's own answer; inside a tmux pane tmux has
+    replaced it with "tmux", but LC_TERMINAL (which iTerm2 also forwards over ssh) survives. Neither is set
+    for a phone or a plain SSH client, even though the it2 binary exists on the Mac."""
+    return env.get("TERM_PROGRAM") == "iTerm.app" or env.get("LC_TERMINAL") == "iTerm2"
+
+
 def attach_command(name: str, env) -> list[str]:
     """The right verb for the current terminal: switch inside tmux, -CC in iTerm2, plain elsewhere."""
     if env.get("TMUX"):
         return ["tmux", "switch-client", "-t", name]
-    if env.get("TERM_PROGRAM") == "iTerm.app" or env.get("LC_TERMINAL") == "iTerm2":
+    if in_iterm2(env):
         return ["tmux", "-CC", "attach", "-t", name]
     return ["tmux", "attach", "-t", name]
 
 
 def cc_tab_command(name: str) -> str:
-    """Command line for a fresh iTerm2 tab that attaches in control mode (login shell => user PATH).
+    """Command line for a fresh iTerm2 tab that attaches in control mode.
+
+    `it2 tab new --command` does not run the string as the tab's process: it opens the profile's login shell
+    and types the line into it. So the line has to (1) attach and (2) end that shell afterwards, otherwise a
+    killed or detached session leaves the tab open on a bare prompt. `exec` keeps the tmux client the only
+    child while it runs; the trailing `exit` closes the shell, and with it the tab, once tmux leaves. If a
+    future it2 ever runs the string directly, the extra words become harmless zsh positional parameters.
 
     The target keeps its quotes: zsh expands a bare `=word` to the path of the command `word` (the EQUALS
     option, on by default), so `-t =my-proj` aborts the whole line with "not found" and the tab silently
     stays a plain shell. Only plain names are accepted: iTerm2 parses the string, then zsh does."""
     if not valid_session_name(name):
         raise ValueError(f"session name {name!r} is not safe to put on a command line")
-    return f"""/bin/zsh -lc 'exec tmux -CC attach -t "={name}"'"""
+    return f"""/bin/zsh -lc 'exec tmux -CC attach -t "={name}"'; exit"""

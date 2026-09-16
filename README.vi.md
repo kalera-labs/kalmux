@@ -94,8 +94,8 @@ Xong thì mở toolbelt: **View > Toolbelt** (⇧⌘B) rồi chọn **Kalmux**. 
 
 ```
 kalmux ls [--json]            mọi session kèm project, trạng thái Claude, % context, tuổi, tiêu đề, màu
-kalmux go <chủ đề>            nhảy tới session theo tên, hoặc một phần tên project / tiêu đề Claude
-kalmux open <session>         mở session thành tab control-mode mới trong cửa sổ hiện tại
+kalmux go <chủ đề>            nhảy tới session theo tên, hoặc một phần tên project / tiêu đề Claude; qua SSH thì attach tại chỗ
+kalmux open <session>         mở session thành tab control-mode mới trong cửa sổ hiện tại (session mất là tab đóng theo)
 kalmux color <session> <c>    màu nhận diện: #rrggbb, một trong 20 tên màu, hoặc none
 kalmux new <tên> [--cwd D] [--color C] [--claude] [--no-attach]
 kalmux kill | detach <session>        kalmux rename <session> <tên mới>
