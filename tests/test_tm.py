@@ -19,7 +19,7 @@ from fakes import (
     write_status,
     write_trail,
 )
-from kalmux import tmconfig, tmcore, tmsetup
+from kalmux import tmconfig, tmcore, tmrestore, tmsetup
 
 
 # ---------- colors ----------
@@ -410,6 +410,25 @@ def test_real_tmux_wrapper_roundtrip(tm, fake_bins):
     assert "send-keys -t %42 -l -- --dangerously-skip-permissions" in log
 
 
+def test_real_it2_new_window_types_the_command_into_its_only_session(tm, tmp_path, fake_bins):
+    # `it2 window new --command` runs nothing on iTerm2 3.7.3 (the window opens on a bare login shell), so
+    # the window is opened bare and the line is typed into its session, the way `tab new --command` does it
+    (tmp_path / "sessions.json").write_text(it2_json([it2_json_row("G-2", "✳ T (claude)", tab="9"),
+                                                        it2_json_row("G-NEW", "~ (-zsh)", window="pty-NEW", is_tmux=False)]) + "\n")
+    it2 = tm.It2()
+    assert it2.new_window("cmd 'x'") == (True, "Created new window: pty-NEW")
+    log = fake_bins["log"].read_text()
+    assert "it2 window new\n" in log and "--command" not in log
+    assert "it2 session run cmd 'x' --session G-NEW" in log
+
+
+def test_real_it2_new_window_fails_loudly_when_it_cannot_find_the_window_session(tm, fake_bins):
+    # the fixture lists no session in pty-NEW: nothing to type into, so the caller must not believe it opened
+    ok, out = tm.It2().new_window("cmd")
+    assert ok is False and "pty-NEW" in out and "no session" in out
+    assert "it2 session run" not in fake_bins["log"].read_text()
+
+
 def test_real_it2_wrapper(tm, fake_bins):
     it2 = tm.It2()
     assert it2.path == str(fake_bins["bin"] / "it2")
@@ -419,7 +438,7 @@ def test_real_it2_wrapper(tm, fake_bins):
     assert rows[0]["is_tmux"] is False and rows[0]["tty"] == "/dev/ttys001"
     assert it2.get_var("G-2", "tmuxWindowPane") == "0" and it2.get_var("G-1", "tmuxWindowPane") == ""
     assert it2.current_window() == "pty-FAKE"
-    assert it2.list_windows() == ["pty-FAKE", "pty-OTHER"] and it2.new_window("cmd") == (True, "Created new window: pty-NEW")
+    assert it2.list_windows() == ["pty-FAKE", "pty-OTHER"]
     assert it2.new_tab("cmd", "pty-FAKE") == (True, "Created new tab: 3")
     it2.focus("G-2")
     it2.activate()
@@ -932,3 +951,77 @@ def test_the_tap_runs_end_to_end_through_the_cli(tm, tmp_path):
     assert sink.read_bytes() == payload
     written = json.loads((state / "status" / "0f7b1c2d-3e4f-4a5b-8c9d-0e1f2a3b4c5d.json").read_text())
     assert written["context_pct"] == 42
+
+
+# ---------- restore after a reboot ----------
+def write_sessions(path, boot, *names, cwd="/tmp"):
+    sessions = tuple(tmrestore.SavedSession(name=n, cwd=cwd, created=1000 + i) for i, n in enumerate(names))
+    tmrestore.write_snapshot(path, tmrestore.Snapshot(boot=boot, saved_at=1, sessions=sessions))
+    return path
+
+
+def test_cmd_restore_recreates_the_previous_boots_sessions(tm, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(tm.os, "environ", {"TERM_PROGRAM": "iTerm.app", "HOME": str(tmp_path)})
+    monkeypatch.setattr(tmrestore, "boot_time", lambda: 222)
+    path = write_sessions(tmp_path / "sessions.json", 111, "api", "web", cwd=str(tmp_path))
+    t, it2 = FakeTmux(panes=[pane("api")]), FakeIt2(window="pty-CUR")
+    assert tm.cmd_restore(t, it2, path, tmp_path / "prev.json") == 0
+    out = capsys.readouterr().out
+    assert "boot 111" in out and str(path) in out
+    assert t.has_session("web") and ("new", "web", str(tmp_path)) in t.calls
+    assert [w for _c, w in it2.tabs] == ["pty-CUR"]                 # one tab, for the one session created
+    assert tmrestore.read_snapshot(path).boot == 111                # the CLI never rewrites the snapshot
+
+
+def test_cmd_restore_dry_run_changes_nothing(tm, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(tm.os, "environ", {"TERM_PROGRAM": "iTerm.app"})
+    monkeypatch.setattr(tmrestore, "boot_time", lambda: 222)
+    path = write_sessions(tmp_path / "sessions.json", 111, "api", "web", cwd="/nowhere-at-all")
+    t, it2 = FakeTmux(panes=[pane("api")]), FakeIt2(window="pty-CUR")
+    assert tm.cmd_restore(t, it2, path, tmp_path / "prev.json", dry_run=True) == 0
+    out = capsys.readouterr().out
+    assert "exists  api" in out and "create  web" in out and "/nowhere-at-all is gone" in out
+    assert not t.has_session("web") and it2.tabs == []
+
+
+def test_cmd_restore_opens_no_tab_outside_iterm2_or_with_no_tabs(tm, tmp_path, monkeypatch, capsys):
+    """Same rule as `kalmux go`: driving iTerm2 from an SSH session would move tabs on a Mac far away."""
+    monkeypatch.setattr(tmrestore, "boot_time", lambda: 222)
+    path = write_sessions(tmp_path / "sessions.json", 111, "web", cwd=str(tmp_path))
+    monkeypatch.setattr(tm.os, "environ", {"SSH_TTY": "/dev/ttys001"})
+    it2 = FakeIt2(window="pty-CUR")
+    assert tm.cmd_restore(FakeTmux(panes=[]), it2, path, tmp_path / "prev.json") == 0 and it2.tabs == []
+    monkeypatch.setattr(tm.os, "environ", {"TERM_PROGRAM": "iTerm.app"})
+    assert tm.cmd_restore(FakeTmux(panes=[]), it2, path, tmp_path / "prev.json", no_tabs=True) == 0
+    assert it2.tabs == []
+    capsys.readouterr()
+
+
+def test_cmd_restore_without_a_list_says_so(tm, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(tmrestore, "boot_time", lambda: 222)
+    assert tm.cmd_restore(FakeTmux(panes=[]), FakeIt2(), tmp_path / "none.json", tmp_path / "prev.json") == 1
+    assert "no saved session list" in capsys.readouterr().err
+    empty = write_sessions(tmp_path / "sessions.json", 111)
+    assert tm.cmd_restore(FakeTmux(panes=[]), FakeIt2(), empty, tmp_path / "prev.json") == 0
+    assert "nothing to restore" in capsys.readouterr().out
+
+
+def test_main_dispatches_restore_and_ui_serve_keeps_sessions(tm, tmp_path, monkeypatch, capsys):
+    seen = {}
+
+    def record(key):
+        def call(*args, **kwargs):
+            seen[key] = (args, kwargs)
+            return 0
+        return call
+
+    monkeypatch.setattr(tm, "Tmux", lambda: FakeTmux(panes=[]))
+    monkeypatch.setattr(tm, "It2", FakeIt2)
+    monkeypatch.setattr(tm, "cmd_restore", record("restore"))
+    assert tm.main(["restore", "--dry-run", "--no-tabs"]) == 0
+    args, kwargs = seen["restore"]
+    assert args[2:] == (tm.SESSIONS_FILE, tm.PREVIOUS_SESSIONS_FILE)
+    assert kwargs == {"dry_run": True, "no_tabs": True}
+    monkeypatch.setattr(tm, "serve", record("serve"))
+    assert tm.main(["ui", "serve"]) == 0
+    assert seen["serve"][1]["keep_sessions"] is True and seen["serve"][1]["pidfile"] == tm.PIDFILE

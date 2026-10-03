@@ -33,6 +33,7 @@ def it2_json_row(guid, name="✳ x (claude)", window="pty-W1", tab="2", is_tmux=
 
 class FakeTmux:
     path = "/fake/bin/tmux"
+    socket = ""
 
     def __init__(self, panes=None, colors=None, tty=None):
         self.panes = [dict(p) for p in (panes or [])]
@@ -40,9 +41,39 @@ class FakeTmux:
         self.calls = []
         self.tty = tty
         self.fail: set[str] = set()
+        self.down = False          # like a tmux server that is not running: every command exits 1
 
     def list_panes(self):
         return [dict(p) for p in self.panes]
+
+    def _session_names(self):
+        """Session names in the order their first pane appeared (the fake's creation order)."""
+        return list(dict.fromkeys(p["session"] for p in self.panes))
+
+    def _session_fields(self, index, name):
+        first = next(p for p in self.panes if p["session"] == name)
+        return {"#{session_id}": f"${index}", "#{session_name}": name, "#{pane_current_path}": first["path"],
+                "#{@tm_color}": self.colors.get(name, first.get("tm_color", "")),
+                "#{session_created}": str(1000 + index)}
+
+    def run_rc(self, *args):
+        """Only what the restore code needs: `list-sessions -F <format>`, token by token."""
+        self.calls.append(("run", *args))
+        if self.down:
+            return 1, ""                      # no server: tmux prints the error on stderr and exits 1
+        if not args or args[0] != "list-sessions":
+            return 0, ""
+        fmt = args[args.index("-F") + 1] if "-F" in args else "#{session_name}"
+        lines = []
+        for index, name in enumerate(self._session_names()):
+            line = fmt
+            for token, value in self._session_fields(index, name).items():
+                line = line.replace(token, value)
+            lines.append(line)
+        return 0, "\n".join(lines) + ("\n" if lines else "")
+
+    def run(self, *args):
+        return self.run_rc(*args)[1]
 
     def show_session_option(self, session, name):
         self.calls.append(("show", session, name))
@@ -125,6 +156,8 @@ class FakeIt2:
         self.fail_tab = False
         self.windows: list[str] = []
         self.new_windows: list[str] = []
+        self.new_window_id = "pty-NEW"                          # "" = it2 opened a window it cannot name
+        self.new_window_reply = "Created new window: pty-NEW"   # set to text without an id to drop the id
         self.get_var_calls = 0
 
     def available(self):
@@ -149,7 +182,11 @@ class FakeIt2:
 
     def new_window(self, command):
         self.new_windows.append(command)
-        return (False, "boom") if self.fail_tab else (True, "Created new window: pty-NEW")
+        if self.fail_tab:
+            return False, "boom"
+        if self.new_window_id:
+            self.windows.insert(0, self.new_window_id)     # it2 lists the front-most window first
+        return True, self.new_window_reply
 
     def new_tab(self, command, window=""):
         self.tabs.append((command, window))

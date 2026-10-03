@@ -120,6 +120,25 @@ def test_ensure_config_leaves_the_legacy_file_alone_when_a_new_one_exists(tmp_pa
     assert legacy.read_text() == '[claude]\nnew = "old"\n' and new.read_text() == '[claude]\nnew = "current"\n'
 
 
+def test_restore_enabled_is_a_bool_that_defaults_to_true(tmp_path):
+    path = tmp_path / "config.toml"
+    assert tmconfig.load_config(path)["restore"] == {"enabled": True}
+    path.write_text("[restore]\nenabled = false\n")
+    cfg = tmconfig.load_config(path)
+    assert cfg["_errors"] == [] and cfg["restore"]["enabled"] is False
+    assert "restore.enabled = False" in tmconfig.describe(cfg)
+    assert "[restore]" in tmconfig.CONFIG_TEMPLATE and "enabled = true" in tmconfig.CONFIG_TEMPLATE
+
+
+@pytest.mark.parametrize("body,expect", [('[restore]\nenabled = "yes"\n', "restore.enabled"),
+                                         ("restore = 3\n", "[restore]")])
+def test_bad_restore_values_fall_back_to_the_default(tmp_path, body, expect):
+    path = tmp_path / "config.toml"
+    path.write_text(body)
+    cfg = tmconfig.load_config(path)
+    assert cfg["restore"] == {"enabled": True} and any(expect in e for e in cfg["_errors"]), cfg["_errors"]
+
+
 def test_notify_values_are_honoured_and_described(tmp_path):
     path = tmp_path / "config.toml"
     path.write_text('[notify]\niterm2 = "never"\nbell = true\n')

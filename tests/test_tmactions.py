@@ -208,7 +208,7 @@ def test_action_open_falls_back_when_iterm2_has_no_current_window():
     it2.windows = []
     r = ta.action_open(tmux, it2, "ok")
     assert r.ok and "new window" in r.message and it2.new_windows == ["""/bin/zsh -lc 'exec tmux -CC attach -t "=ok"'; exit"""]
-    it2.fail_tab = True
+    it2.windows, it2.fail_tab = [], True      # the window the line above opened is gone again
     assert "window new failed" in ta.action_open(tmux, it2, "ok").message
 
 

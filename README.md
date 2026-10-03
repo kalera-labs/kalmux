@@ -44,6 +44,8 @@ Three small pieces do the work: a hook wrapper, the `kalmux` CLI, and a web UI s
 
 **A `Gone` section that brings sessions back.** On 14 September 2026 an agent tidying up its own sandbox ran `tmux kill-server`. The session it ran in was itself inside tmux, so `$TMUX` pointed at the real server: four sessions, every tab, and hours of work went away in one command. Kalmux now writes a small trail for every Claude session (its id, folder, tmux pane and identity color). When a session dies, its card moves to `Gone` with a **Resume** button that recreates the tmux session in the right folder with the right color and types `claude --resume <id>` at the prompt, waiting for your Enter. The repository also carries a `CLAUDE.md` that forbids agents from ever running `tmux kill-server` again.
 
+**Your sessions survive a reboot.** A restart kills the tmux server and every session in it. Kalmux records the live list every five seconds, and the first time you open iTerm2 after the machine has booted it recreates each session that was still open — same name, same directory, same color — one tab each. `claude --continue` in a restored tab picks that directory's conversation up where it stopped.
+
 **Identity colors that survive everything.** Twenty palette names or any hex value, stored in the tmux session itself and replayed into the iTerm2 tab on every attach, so a project keeps its color across detach, reboot and rebuild.
 
 **Everything from the keyboard.** `Go to waiting` jumps to the first agent that needs you, `n` cycles through the rest, `1`-`9` open the nth card, `/` searches by session name, project or the title Claude gave the conversation.
@@ -102,6 +104,8 @@ kalmux kill | detach <session>        kalmux rename <session> <new>
 kalmux dead [--all] [--json]  Claude sessions that are gone: killed first, then the clean exits
 kalmux resume <id|name>       recreate the tmux session and type `claude --resume <id>` at the prompt
 kalmux forget <session-id>    drop a dead session's trail
+kalmux restore [--dry-run] [--no-tabs]
+                              recreate the sessions that were open before the last reboot
 kalmux attach <session>       the right verb for where you are: -CC in iTerm2, switch-client in tmux, plain over SSH
 kalmux reapply [session]      re-send state and tab color to attached panes
 kalmux ui show|status|start|stop|restart|install|uninstall|url|serve
@@ -130,6 +134,23 @@ Dead sessions are classified `killed` (no `SessionEnd` ever arrived), `clean` (l
 
 **Known blind spot:** a shell running a script of its own kind, a bash script under a bash shell, reports the shell's own name, so `busy` reads it as an empty prompt. Catching that needs a shell hook rather than a tmux format.
 
+## Restore after a reboot
+
+A reboot kills the tmux server and every session with it. Quitting iTerm2 does not: it only detaches its control-mode clients, so a session that disappears while the machine is up was really killed, and one that disappears across a restart was not. Kalmux keeps that difference in a file.
+
+The UI server records the live sessions — name, directory, identity color, creation order — into `${KALMUX_STATE_DIR}/sessions.json` every five seconds, and immediately after any kill, rename, new or resume. It writes only when the list changed, and never writes an empty list while tmux is merely unreachable for a moment: at a shutdown every process is signalled at once, so the server is long gone before the thirty-second grace period is up and the last good list survives. The server also takes one final snapshot when it is asked to stop.
+
+The trigger is the boot time (`kern.boottime`), not "the tmux server is down": `kalmux ui restart` and a plain iTerm2 relaunch would otherwise look the same. When the first server of a new boot starts, it copies the saved list to `sessions.previous.json`, recreates every session that is not already there (an existing name is never stolen or renamed; a directory that has moved falls back to `$HOME` and says so), opens one iTerm2 tab per restored session — a window first, because after a reboot there is none — and then records the state of this boot, so a later restart does not restore twice. Everything it did is in `ui.log`, and `kalmux doctor` shows the snapshot's age and whether it still matches the live sessions.
+
+Only name, directory and color come back: no windows, no panes, no running processes and no conversation. A restored session is a shell in the right directory, which is what `claude --continue` needs.
+
+```bash
+kalmux restore --dry-run     # what would happen: create / exists / its directory is gone -> ~
+kalmux restore               # do it by hand (and `--no-tabs` to skip the iTerm2 tabs)
+```
+
+`kalmux restore` reads the previous boot's list and never writes the snapshot, so you can run it as often as you like. Set `enabled = false` under `[restore]` to keep the recording but turn the automatic part off.
+
 ## Configuration
 
 `~/.config/kalmux/config.toml` is yours; Kalmux creates it once and never rewrites it.
@@ -150,6 +171,12 @@ keep_days = 30
 # "auto": post the iTerm2 alert Claude Code skips inside tmux, unless you set preferredNotifChannel yourself.
 iterm2 = "auto"
 bell = false
+
+[restore]
+# After a reboot, the first iTerm2 launch recreates every tmux session that was still open (same name,
+# directory and color), each in its own tab. `kalmux restore` does the same by hand.
+# The session list is recorded either way; this only turns the automatic restore on and off.
+enabled = true
 ```
 
 If you live in `--dangerously-skip-permissions`, put it in these templates once and both `new` and `resume` will follow. Changes take effect immediately; no restart.
@@ -175,6 +202,8 @@ Status replay only ever writes to character devices under `/dev`, tmux records t
 `kalmux doctor` checks the config file, the hook symlink, the hook wiring in `settings.json`, `jq`, the tmux.conf block, both iTerm2 preferences, the toolbelt registration, the AutoLaunch script and its baked paths, the status-line routing, and the server: that it answers, that it runs this version of the code, and which `tmux` binary it can see.
 
 After changing Kalmux's own code, run `kalmux ui restart` from a shell inside iTerm2, so the server keeps iTerm2's TCC grants.
+
+**A restart that never happens.** iTerm2 asks "Quit iTerm2?" when something tells it to quit, and macOS waits for that dialog during a restart: the machine sits there until you answer, and if you walked away it is still sitting there when you come back. The sessions are safe either way — iTerm2 only detaches its tmux clients — but nothing restarts. Lift it with `defaults write com.googlecode.iterm2 NeverBlockSystemShutdown -bool true` (Kalmux never changes this preference for you). The confirmation then only applies to a Cmd-Q you typed yourself.
 
 ## Development
 

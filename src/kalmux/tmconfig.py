@@ -24,6 +24,9 @@ DEFAULTS: dict = {
         "iterm2": "auto",
         "bell": False,
     },
+    "restore": {
+        "enabled": True,
+    },
 }
 
 CONFIG_TEMPLATE = """\
@@ -51,6 +54,12 @@ keep_days = 30
 iterm2 = "auto"
 # Also ring the terminal bell with the alert, like Claude's own "iterm2_with_bell".
 bell = false
+
+[restore]
+# After a reboot, the first iTerm2 launch recreates every tmux session that was still open (same name,
+# directory and color), each in its own tab. `kalmux restore` does the same by hand.
+# The session list is recorded either way; this only turns the automatic restore on and off.
+enabled = true
 """
 
 RESUME_MODES = ("type", "run")
@@ -97,13 +106,38 @@ def _valid_command(value, errors: list[str], where: str, need_placeholder: str =
     return text
 
 
+def _table(raw: dict, name: str, errors: list[str]) -> dict:
+    """One section of the file, or {} plus an error when the user wrote something that is not a table."""
+    section = raw.get(name, {})
+    if isinstance(section, dict):
+        return section
+    errors.append(f"[{name}]: expected a table")
+    return {}
+
+
+def _flag(section: dict, key: str, where: str, errors: list[str]) -> bool | None:
+    """A strict bool: 1 and "yes" are not true here, they are a typo worth reporting."""
+    if key not in section:
+        return None
+    if isinstance(section[key], bool):
+        return section[key]
+    errors.append(f"{where}: expected true or false")
+    return None
+
+
 def _validate(raw: dict) -> tuple[dict, list[str]]:
     cfg = copy.deepcopy(DEFAULTS)
     errors: list[str] = []
-    claude = raw.get("claude", {})
-    if not isinstance(claude, dict):
-        errors.append("[claude]: expected a table")
-        claude = {}
+    _validate_claude(_table(raw, "claude", errors), cfg, errors)
+    _validate_tombstones(_table(raw, "tombstones", errors), cfg, errors)
+    _validate_notify(_table(raw, "notify", errors), cfg, errors)
+    enabled = _flag(_table(raw, "restore", errors), "enabled", "restore.enabled", errors)
+    if enabled is not None:
+        cfg["restore"]["enabled"] = enabled
+    return cfg, errors
+
+
+def _validate_claude(claude: dict, cfg: dict, errors: list[str]) -> None:
     if "new" in claude:
         v = _valid_command(claude["new"], errors, "claude.new")
         if v is not None:
@@ -117,31 +151,26 @@ def _validate(raw: dict) -> tuple[dict, list[str]]:
             cfg["claude"]["resume_mode"] = claude["resume_mode"]
         else:
             errors.append(f"claude.resume_mode: expected one of {', '.join(RESUME_MODES)}")
-    tomb = raw.get("tombstones", {})
-    if not isinstance(tomb, dict):
-        errors.append("[tombstones]: expected a table")
-        tomb = {}
+
+
+def _validate_tombstones(tomb: dict, cfg: dict, errors: list[str]) -> None:
     if "keep_days" in tomb:
         v = tomb["keep_days"]
         if isinstance(v, int) and not isinstance(v, bool) and 1 <= v <= 3650:
             cfg["tombstones"]["keep_days"] = v
         else:
             errors.append("tombstones.keep_days: expected an integer between 1 and 3650")
-    notify = raw.get("notify", {})
-    if not isinstance(notify, dict):
-        errors.append("[notify]: expected a table")
-        notify = {}
+
+
+def _validate_notify(notify: dict, cfg: dict, errors: list[str]) -> None:
     if "iterm2" in notify:
         if notify["iterm2"] in NOTIFY_MODES:
             cfg["notify"]["iterm2"] = notify["iterm2"]
         else:
             errors.append(f"notify.iterm2: expected one of {', '.join(NOTIFY_MODES)}")
-    if "bell" in notify:
-        if isinstance(notify["bell"], bool):
-            cfg["notify"]["bell"] = notify["bell"]
-        else:
-            errors.append("notify.bell: expected true or false")
-    return cfg, errors
+    bell = _flag(notify, "bell", "notify.bell", errors)
+    if bell is not None:
+        cfg["notify"]["bell"] = bell
 
 
 def load_config(path: Path | None = None, env: dict | None = None) -> dict:
@@ -199,7 +228,7 @@ def describe(cfg: dict) -> str:
     """Human-readable dump for `kalmux config`."""
     path = cfg.get("_path", "")
     lines = [f"config: {path}" + ("" if Path(path).exists() else " (missing; defaults in effect; `kalmux setup` creates it)")]
-    for section in ("claude", "tombstones", "notify"):
+    for section in ("claude", "tombstones", "notify", "restore"):
         for key, value in cfg[section].items():
             lines.append(f"  {section}.{key} = {value!r}")
     for err in cfg.get("_errors", []):

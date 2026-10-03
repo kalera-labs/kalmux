@@ -15,7 +15,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import tmconfig, tmsetup, tmstatusline
+from . import tmconfig, tmrestore, tmsetup, tmstatusline
 from .tmactions import (
     TabMap,
     action_color,
@@ -56,6 +56,8 @@ from .tmsetup import (
     DEFAULT_SETTINGS,
     DEFAULT_TM_LINK,
     DEFAULT_TMUX_CONF,
+    PREVIOUS_SESSIONS_FILE,
+    SESSIONS_FILE,
     STATE_DIR,
     STATUS_DIR,
     TRACE_DIR,
@@ -188,11 +190,39 @@ def cmd_forget(trace_dir, session_id: str, status_dir=None) -> int:
     return _report(action_forget(Path(trace_dir), session_id, status_dir))
 
 
+# ----------------------------------------------------------------------------- restore after a reboot
+def cmd_restore(tmux: Tmux, it2: It2, sessions_file: Path, previous_file: Path, dry_run: bool = False,
+                no_tabs: bool = False, env=None, now: int | None = None) -> int:
+    """Bring back by hand what the previous boot had open; the ui server does it on its own at startup.
+
+    The CLI only ever READS the snapshot: rewriting it here would tell the next server start that this
+    boot's restore has already happened."""
+    env = os.environ if env is None else env
+    snap, source = tmrestore.restore_source(sessions_file, previous_file, tmrestore.boot_time())
+    if snap is None:
+        print(f"kalmux restore: no saved session list in {sessions_file} or {previous_file}", file=sys.stderr)
+        return 1
+    now = int(time.time()) if now is None else now
+    print(f"kalmux restore: {len(snap.sessions)} session(s) from {source} "
+          f"(boot {snap.boot}, saved {fmt_age(max(0, now - snap.saved_at))} ago)")
+    if not snap.sessions:
+        print("kalmux restore: nothing to restore")
+        return 0
+    if dry_run:
+        print("\n".join(tmrestore.plan(tmux, snap.sessions)))
+        return 0
+    created = tmrestore.restore(tmux, snap.sessions, log=print)
+    # the same rule as `kalmux go`: away from the desk, opening tabs would rearrange a Mac far from here
+    if created and not no_tabs and in_iterm2(env) and it2.available():
+        tmrestore.open_tabs(it2, created, socket=getattr(tmux, "socket", ""), log=print)
+    return 0
+
+
 # ----------------------------------------------------------------------------- ui server
 def cmd_ui(args) -> int:
     sub = args.ui_cmd
     if sub == "serve":
-        return serve(args.port, pidfile=PIDFILE)
+        return serve(args.port, pidfile=PIDFILE, keep_sessions=True)
     if sub == "url":
         print(UI_URL)
         return 0
@@ -357,7 +387,7 @@ def cmd_statusline(action: str | None = None) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="kalmux", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
                                 epilog="examples:\n  kalmux ls\n  kalmux color my-proj orange\n  kalmux go my-proj\n  kalmux open my-proj\n  kalmux attach my-proj\n"
-                                       "  kalmux new my-proj --cwd ~/Dev/my-proj --color teal --claude\n  kalmux dead\n  kalmux resume alpha\n  kalmux ui show\n  kalmux doctor\n  kalmux setup")
+                                       "  kalmux new my-proj --cwd ~/Dev/my-proj --color teal --claude\n  kalmux dead\n  kalmux resume alpha\n  kalmux restore\n  kalmux ui show\n  kalmux doctor\n  kalmux setup")
     p.add_argument("-V", "--version", action="version", version=f"kalmux {VERSION}")
     sub = p.add_subparsers(dest="cmd")
     ls = sub.add_parser("ls", help="list tmux sessions with Claude state (works over SSH)")
@@ -391,6 +421,10 @@ def build_parser() -> argparse.ArgumentParser:
     res.add_argument("session", help="session id, id prefix, or the tmux session it used to run in")
     fg = sub.add_parser("forget", help="drop a dead session's trail so it stops showing up in `kalmux dead`")
     fg.add_argument("session_id")
+    rs = sub.add_parser("restore", help="recreate the tmux sessions that were open before the last reboot "
+                                        "(name, directory and color), one iTerm2 tab each")
+    rs.add_argument("--dry-run", action="store_true", help="print what would happen and change nothing")
+    rs.add_argument("--no-tabs", action="store_true", help="recreate the sessions without opening any tab")
     ra = sub.add_parser("reapply", help="re-send Claude status + tab color to attached panes (used by the tmux client-attached hook)")
     ra.add_argument("session", nargs="?")
     ui = sub.add_parser("ui", help="the toolbelt web UI server: serve | start | stop | restart | status | show | install (AutoLaunch + toolbelt) | uninstall | url")
@@ -444,6 +478,9 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_resume(tmux, It2(), TRACE_DIR, load_registry(DEFAULT_REGISTRY), load_config(), args.session)
     if args.cmd == "forget":
         return cmd_forget(TRACE_DIR, args.session_id, STATUS_DIR)
+    if args.cmd == "restore":
+        return cmd_restore(tmux, It2(), SESSIONS_FILE, PREVIOUS_SESSIONS_FILE, dry_run=args.dry_run,
+                           no_tabs=args.no_tabs)
     if args.cmd == "reapply":
         return _report(reapply(tmux, args.session))
     if args.cmd == "ui":

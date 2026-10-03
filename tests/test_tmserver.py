@@ -331,6 +331,88 @@ def test_serve_runs_writes_pidfile_and_detects_existing_instance(backend, tmp_pa
     assert "listening on" in out and "already running" in out
 
 
+class SpyKeeper:
+    """Stands in for the SessionKeeper: serve() must build one only when it is asked to keep sessions."""
+
+    def __init__(self):
+        self.calls = []
+
+    def start(self):
+        self.calls.append("start")
+
+    def run_once(self):
+        self.calls.append("tick")
+        return True
+
+    def stop(self):
+        self.calls.append("stop")
+
+
+def test_a_backend_without_a_keeper_behaves_exactly_as_before(backend):
+    assert backend.keeper is None
+    assert backend.do("kill", {"session": "api"}).ok is True      # no keeper: nothing to tick, no crash
+
+
+def test_every_action_that_changes_the_session_list_snapshots_at_once(backend, tmp_path):
+    """Five seconds of lag would be enough to lose a session created right before a shutdown."""
+    backend.keeper = SpyKeeper()
+    backend.do("new", {"name": "fresh", "cwd": str(tmp_path), "open": False})
+    backend.do("rename", {"session": "fresh", "name": "fresher"})
+    backend.do("kill", {"session": "fresher"})
+    backend.do("kill", {"session": "fresher"})                    # already gone: nothing to record
+    backend.do("color", {"session": "api", "color": "teal"})      # not a change to the list
+    assert backend.keeper.calls == ["tick", "tick", "tick"]
+
+
+def test_serve_keeps_sessions_only_when_asked(backend, monkeypatch, tmp_path, capsys):
+    built = []
+    keeper = SpyKeeper()
+    monkeypatch.setattr(tmserver, "build_keeper", lambda b, out: built.append(b) or keeper)
+    handlers = {}
+    monkeypatch.setattr(tmserver.signal, "signal", handlers.setdefault)
+    ready = {}
+    thread = threading.Thread(target=tmserver.serve, args=(0, backend), daemon=True,
+                              kwargs={"keep_sessions": True, "on_ready": lambda h: ready.setdefault("httpd", h)})
+    thread.start()
+    for _ in range(100):
+        if "httpd" in ready:
+            break
+        time.sleep(0.02)
+    assert built == [backend] and keeper.calls == []
+    handlers[tmserver.signal.SIGTERM](15, None)                   # the shutdown path: final snapshot, then stop
+    thread.join(timeout=5)
+    assert keeper.calls == ["stop"] and not thread.is_alive()
+
+
+def test_serve_without_keep_sessions_never_builds_a_keeper(backend, monkeypatch):
+    monkeypatch.setattr(tmserver, "build_keeper", lambda b, out: pytest.fail("built a keeper for a plain serve"))
+    ready = {}
+    thread = threading.Thread(target=tmserver.serve, args=(0, backend), daemon=True,
+                              kwargs={"on_ready": lambda h: ready.setdefault("httpd", h)})
+    thread.start()
+    for _ in range(100):
+        if "httpd" in ready:
+            break
+        time.sleep(0.02)
+    ready["httpd"].shutdown()
+    thread.join(timeout=5)
+    assert backend.keeper is None
+
+
+def test_build_keeper_wires_the_state_files_the_config_and_the_lock(backend, monkeypatch, tmp_path):
+    monkeypatch.setattr(tmserver.tmrestore, "boot_time", lambda: 4711)
+    monkeypatch.setattr(tmserver, "state_files", lambda: (tmp_path / "sessions.json", tmp_path / "prev.json"))
+    backend._injected_config = {**backend.config, "restore": {"enabled": False}}
+    keeper = tmserver.build_keeper(backend, out=None)
+    try:
+        assert keeper.enabled is False and keeper.lock is backend.lock and keeper.boot == 4711
+        assert keeper.snapshotter.path == tmp_path / "sessions.json" and keeper.tmux is backend.tmux
+        assert backend.keeper is keeper and keeper.thread.daemon is True
+    finally:
+        keeper.stop()
+        keeper.thread.join(timeout=5)
+
+
 def test_serve_reports_foreign_port_owner(backend, monkeypatch, capsys):
     monkeypatch.setattr(tmserver, "make_server", lambda *_a, **_k: (_ for _ in ()).throw(OSError("in use")))
     monkeypatch.setattr(tmserver, "health", lambda *_a, **_k: None)

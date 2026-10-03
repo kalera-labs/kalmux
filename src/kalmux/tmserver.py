@@ -20,6 +20,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from . import tmrestore
 from .tmactions import (
     Result,
     TabMap,
@@ -77,6 +78,12 @@ def state_dirs() -> tuple[Path, Path]:
     return STATUS_DIR, TRACE_DIR
 
 
+def state_files() -> tuple[Path, Path]:
+    """(sessions.json, sessions.previous.json) — lazy for the same reason as state_dirs()."""
+    from .tmsetup import PREVIOUS_SESSIONS_FILE, SESSIONS_FILE
+    return SESSIONS_FILE, PREVIOUS_SESSIONS_FILE
+
+
 class Backend:
     """Everything the handler needs, injectable for tests (fake tmux / it2 / ui file / state dirs)."""
 
@@ -95,6 +102,9 @@ class Backend:
         self.started_at = int(time.time())
         self.reapply_delay = reapply_delay
         self.lock = threading.Lock()
+        # set by serve(keep_sessions=True) only: a Backend built in a test keeps no sessions and starts
+        # no thread, so nothing of ours ever writes the real state directory from a test run.
+        self.keeper: tmrestore.SessionKeeper | None = None
 
     @property
     def config(self) -> dict:
@@ -144,6 +154,13 @@ class Backend:
         else:
             reapply(self.tmux, session)
 
+    def _kept(self, r: Result) -> Result:
+        """Snapshot right after an action that changed the session list, instead of up to 5 s later: a
+        session created (or killed) just before a shutdown must not be missing from the saved list."""
+        if r.ok and self.keeper is not None:
+            self.keeper.run_once()
+        return r
+
     def _open_new(self, r: Result, body: dict) -> Result:
         """Show a freshly created (or resumed) session in iTerm2 unless the caller opted out."""
         if r.ok and bool(body.get("open", True)):
@@ -180,15 +197,15 @@ class Backend:
             if action == "new":
                 r = action_new(self.tmux, body.get("name", ""), body.get("cwd", ""), body.get("color", ""),
                                bool(body.get("start_claude", False)), self.config["claude"]["new"])
-                return self._open_new(r, body)
+                return self._open_new(self._kept(r), body)
             if action == "resume":
-                return self._open_new(self._resume(body.get("session_id", "") or session), body)
+                return self._open_new(self._kept(self._resume(body.get("session_id", "") or session)), body)
             if action == "forget":
                 return action_forget(self.trace_dir, body.get("session_id", ""), self.status_dir)
             if action == "kill":
-                return action_kill(self.tmux, session)
+                return self._kept(action_kill(self.tmux, session))
             if action == "rename":
-                return action_rename(self.tmux, session, body.get("name", ""))
+                return self._kept(action_rename(self.tmux, session, body.get("name", "")))
             if action == "detach":
                 return action_detach(self.tmux, session)
             if action == "reapply":
@@ -357,7 +374,20 @@ def make_server(port: int, backend: Backend) -> ThreadingHTTPServer:
     return httpd
 
 
-def serve(port: int, backend: Backend | None = None, pidfile: Path | None = None, out=None, on_ready=None) -> int:
+def build_keeper(backend: Backend, out) -> tmrestore.SessionKeeper:
+    """Start the thread that restores the previous boot's sessions and then keeps the list up to date.
+
+    Built from the real state files, so only `kalmux ui serve` ever asks for one (keep_sessions=True)."""
+    path, previous = state_files()
+    keeper = tmrestore.SessionKeeper(backend.tmux, backend.it2, path, previous,
+                                     enabled=backend.config["restore"]["enabled"], lock=backend.lock, out=out)
+    backend.keeper = keeper
+    keeper.start()
+    return keeper
+
+
+def serve(port: int, backend: Backend | None = None, pidfile: Path | None = None, out=None, on_ready=None,
+          keep_sessions: bool = False) -> int:
     out = out or sys.stdout
     backend = backend or Backend(Tmux(), It2())
     try:
@@ -368,6 +398,8 @@ def serve(port: int, backend: Backend | None = None, pidfile: Path | None = None
             return 0
         print(f"kalmux ui: cannot bind 127.0.0.1:{port}: {exc}", file=out)
         return 1
+    # after the bind, so a second instance that found the port taken never restores anything
+    keeper = build_keeper(backend, out) if keep_sessions else None
     if pidfile:
         try:
             pidfile.parent.mkdir(parents=True, exist_ok=True)
@@ -377,6 +409,8 @@ def serve(port: int, backend: Backend | None = None, pidfile: Path | None = None
 
     def stop(signum, _frame):
         print(f"kalmux ui: signal {signum}, shutting down", file=out, flush=True)
+        if keeper:
+            keeper.stop()        # one last snapshot while tmux is still there to answer
         threading.Thread(target=httpd.shutdown, daemon=True).start()
 
     for sig in (signal.SIGTERM, signal.SIGINT):

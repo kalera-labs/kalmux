@@ -44,6 +44,8 @@ Ba mảnh nhỏ làm hết việc: một cái hook wrapper, CLI `kalmux`, và m�
 
 **Mục `Gone` kéo session sống dậy.** Ngày 14/09/2026, một con agent dọn sandbox của nó đã chạy `tmux kill-server`. Phiên nó chạy lại nằm ngay trong tmux, nên `$TMUX` trỏ vô server thiệt: bốn session, toàn bộ tab, và mấy tiếng làm việc bay sạch trong một câu lệnh. Giờ Kalmux ghi một vệt nhỏ cho từng session Claude (id, thư mục, pane tmux, màu nhận diện). Session nào chết thì thẻ của nó rớt xuống mục `Gone` kèm nút **Resume**: dựng lại session tmux đúng thư mục, đúng màu, gõ sẵn `claude --resume <id>` rồi chờ bạn bấm Enter. Repo cũng có file `CLAUDE.md` cấm tiệt agent chạy `tmux kill-server` lần nữa.
 
+**Khởi động lại máy là session trở về.** Reboot một cái là server tmux chết, kéo theo mọi session. Kalmux ghi lại danh sách đang sống mỗi năm giây, nên lần đầu mở iTerm2 sau khi máy khởi động lại, nó dựng lại từng session còn mở lúc đó — y tên, y thư mục, y màu — mỗi con một tab. Vô tab vừa dựng gõ `claude --continue` là nối lại đúng cuộc hội thoại của thư mục đó liền.
+
 **Màu nhận diện sống dai.** Hai chục tên màu có sẵn hoặc mã hex tùy ý, lưu ngay trong session tmux và phát lại vô tab iTerm2 mỗi lần attach, nên một project giữ nguyên màu qua detach, qua reboot, qua cả lần dựng lại.
 
 **Làm hết bằng bàn phím.** `Go to waiting` nhảy tới con agent đầu tiên đang chờ, `n` chạy vòng qua mấy con còn lại, `1`-`9` mở thẻ thứ n, `/` tìm theo tên session, tên project hoặc cái tiêu đề Claude tự đặt cho cuộc hội thoại.
@@ -102,6 +104,8 @@ kalmux kill | detach <session>        kalmux rename <session> <tên mới>
 kalmux dead [--all] [--json]  mấy session Claude đã mất: bị giết trước, rồi tới mấy con thoát êm
 kalmux resume <id|tên>        dựng lại session tmux và gõ sẵn `claude --resume <id>`
 kalmux forget <session-id>    bỏ vệt của một session đã chết
+kalmux restore [--dry-run] [--no-tabs]
+                              dựng lại mấy session còn mở trước lần reboot gần nhất
 kalmux attach <session>       đúng cách cho từng chỗ: -CC trong iTerm2, switch-client trong tmux, attach thường qua SSH
 kalmux reapply [session]      gởi lại trạng thái với màu tab cho mấy pane đang attach
 kalmux ui show|status|start|stop|restart|install|uninstall|url|serve
@@ -130,6 +134,23 @@ Session đã chết được xếp thành `killed` (chưa từng có `SessionEnd
 
 **Điểm mù đã biết:** một shell chạy script cùng loại với nó, kiểu script bash dưới shell bash, sẽ báo tên của chính cái shell đó, nên `busy` đọc ra thành dấu nhắc trống. Bắt được ca này phải cắm hook vô shell chớ format của tmux không thấy.
 
+## Dựng lại session sau khi reboot
+
+Reboot là server tmux chết, mọi session chết theo. Thoát iTerm2 thì không: nó chỉ detach mấy client control-mode thôi, nên session nào biến mất lúc máy còn chạy là bị giết thiệt, còn session biến mất qua một lần khởi động lại thì không. Kalmux giữ đúng cái khác biệt đó trong một file.
+
+Server UI ghi danh sách session đang sống — tên, thư mục, màu nhận diện, thứ tự tạo — vô `${KALMUX_STATE_DIR}/sessions.json` mỗi năm giây, và ghi liền sau mỗi lần kill, rename, new hay resume. Danh sách có đổi nó mới ghi, mà tmux lỡ im một chút thì nó cũng không ghi danh sách rỗng: lúc máy tắt, mọi tiến trình bị gởi tín hiệu cùng lúc, server đi từ lâu trước khi hết ba chục giây chờ, nên danh sách tốt cuối cùng còn nguyên. Lúc được kêu dừng, server còn chụp thêm một bản cuối.
+
+Cái kích hoạt là giờ boot của nhân (`kern.boottime`) chớ không phải "server tmux không chạy": nếu không thì `kalmux ui restart` với mở lại iTerm2 cũng y chang một lần reboot. Server đầu tiên của một lần boot mới sẽ chép danh sách đã lưu qua `sessions.previous.json`, dựng lại mọi session chưa có (tên nào đang có chủ thì để yên, không giành, không đổi tên; thư mục nào đi mất thì mở ở `$HOME` và nói rõ ra), mở mỗi session một tab iTerm2 — con đầu phải mở cửa sổ trước, vì sau reboot làm gì có cửa sổ nào — rồi ghi lại trạng thái của lần boot này, để lần restart sau khỏi dựng lại lần nữa. Nó làm gì đều nằm trong `ui.log`, còn `kalmux doctor` cho coi bản ghi cũ bao lâu rồi và còn khớp với mấy session đang sống hay không.
+
+Chỉ tên, thư mục với màu trở về thôi: không window, không pane, không tiến trình đang chạy, không cuộc hội thoại. Session dựng lại là một cái shell nằm đúng thư mục — đúng thứ `claude --continue` cần.
+
+```bash
+kalmux restore --dry-run     # coi trước: tạo mới / đã có sẵn / thư mục đi mất -> ~
+kalmux restore               # làm bằng tay (thêm `--no-tabs` nếu khỏi mở tab iTerm2)
+```
+
+`kalmux restore` đọc danh sách của lần boot trước và không bao giờ ghi đè bản ghi, nên chạy bao nhiêu lần cũng được. Muốn giữ phần ghi nhận mà tắt phần tự động thì để `enabled = false` trong `[restore]`.
+
 ## Cấu hình
 
 `~/.config/kalmux/config.toml` là của bạn; Kalmux tạo một lần rồi không bao giờ ghi đè.
@@ -150,6 +171,12 @@ keep_days = 30
 # "auto": đăng giùm cái thông báo iTerm2 mà Claude Code bỏ qua khi ở trong tmux, trừ khi bạn đã tự đặt preferredNotifChannel.
 iterm2 = "auto"
 bell = false
+
+[restore]
+# Sau khi reboot, lần mở iTerm2 đầu tiên sẽ dựng lại mọi session tmux còn mở lúc đó (y tên, y thư mục,
+# y màu), mỗi con một tab. `kalmux restore` làm đúng việc đó bằng tay.
+# Danh sách session thì lúc nào cũng được ghi; khóa này chỉ bật/tắt phần dựng lại tự động.
+enabled = true
 ```
 
 Ai quen xài `--dangerously-skip-permissions` thì bỏ vô hai mẫu lệnh này một lần, `new` với `resume` tự theo. Sửa xong có hiệu lực liền, khỏi khởi động lại.
@@ -175,6 +202,8 @@ Phần phát lại trạng thái chỉ ghi vô thiết bị ký tự dưới `/d
 `kalmux doctor` kiểm file cấu hình, symlink hook, phần nối hook trong `settings.json`, `jq`, khối trong tmux.conf, hai tùy chọn iTerm2, đăng ký toolbelt, script AutoLaunch với mấy đường dẫn nhúng trong đó, đường đi của status line, và server: có trả lời không, có đang chạy đúng phiên bản code này không, và nó thấy `tmux` ở đâu.
 
 Sau khi sửa code của Kalmux thì chạy `kalmux ui restart` từ một shell bên trong iTerm2, để server giữ được mấy quyền TCC của iTerm2.
+
+**Lệnh khởi động lại máy nằm chờ hoài.** Hễ có gì kêu iTerm2 thoát là nó hỏi "Quit iTerm2?", mà macOS thì đứng chờ cái hộp thoại đó trong lúc restart: máy nằm im tới chừng nào bạn trả lời, đi đâu một hồi quay lại nó vẫn còn nằm đó. Session thì không sao — iTerm2 chỉ detach mấy client tmux thôi — nhưng máy không khởi động lại được. Muốn bỏ chặn thì chạy `defaults write com.googlecode.iterm2 NeverBlockSystemShutdown -bool true` (Kalmux không bao giờ tự đụng vô tùy chọn này). Sau đó hộp thoại xác nhận chỉ còn hiện khi chính bạn bấm Cmd-Q.
 
 ## Phát triển
 

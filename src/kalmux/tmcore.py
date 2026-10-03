@@ -59,10 +59,12 @@ SOURCE_CHECKOUT = _checkout if (_checkout / "pyproject.toml").is_file() and (_ch
 ROOT = SOURCE_CHECKOUT or PKG_DIR                      # a symlink pointing inside this is one of ours
 DEFAULT_REGISTRY = Path.home() / ".claude/sessions"
 SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}$")
+SOCKET_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")   # `tmux -L <name>`: a file name, never a path
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 WINDOW_ID_RE = re.compile(r"^@\d+$")
+IT2_WINDOW_RE = re.compile(r"(pty-[A-Za-z0-9._:-]+)")   # `it2 window new` prints "Created new window: pty-XYZ"
 PANE_ID_RE = re.compile(r"^%\d+$")
 TTY_RE = re.compile(r"^/dev/(pts/\d+|[A-Za-z0-9._-]+)$")
 IT2_TIMEOUT = 6
@@ -197,14 +199,28 @@ def resolve_tmux(path_env: str | None = None) -> str:
 
 
 class Tmux:
-    def __init__(self, path: str | None = None) -> None:
+    """Every tmux call this app makes. With `socket`, they all go to a private server (`tmux -L <name>`)
+    instead of the user's: that is what lets a test drive the real code without touching real sessions."""
+
+    def __init__(self, path: str | None = None, socket: str | None = None) -> None:
         self.path = resolve_tmux() if path is None else path
+        if socket and not SOCKET_NAME_RE.match(socket):
+            raise ValueError(f"not a tmux socket name: {socket!r}")
+        self.socket = socket or ""
+
+    def _argv(self, args: tuple[str, ...]) -> list[str]:
+        return [self.path, *(("-L", self.socket) if self.socket else ()), *args]
+
+    def _env(self) -> dict | None:
+        # -L already wins over $TMUX, but a child that cannot even see the variable cannot be pointed at
+        # the user's server by anything downstream either (tmux resolves -S > -L > $TMUX > TMUX_TMPDIR).
+        return {k: v for k, v in os.environ.items() if k != "TMUX"} if self.socket else None
 
     def run_rc(self, *args: str) -> tuple[int, str]:
         if not self.path:
             return 127, ""
         try:
-            p = subprocess.run([self.path, *args], capture_output=True, check=False, timeout=15)
+            p = subprocess.run(self._argv(args), capture_output=True, check=False, timeout=15, env=self._env())
         except (OSError, subprocess.TimeoutExpired):
             return 127, ""
         return p.returncode, _decode(p.stdout)
@@ -357,8 +373,22 @@ class It2:
         return [line.split("\t", 1)[0].strip() for line in self._run("window", "list").splitlines() if line.startswith("pty-")]
 
     def new_window(self, command: str) -> tuple[bool, str]:
-        rc, out = self._run_rc("window", "new", "--command", command)
-        return rc == 0, out.strip()
+        """Open a window and run `command` in it; the reply keeps it2's "Created new window: <id>" line.
+
+        `it2 window new --command` runs nothing on iTerm2 3.7.3 (seen live 2026-10-03): it fills a field the
+        API has deprecated, and the window opens on a bare login shell. `tab new --command` types the line
+        into the new session instead (a SendText of the line + CR), so the window is opened bare and the
+        line is run in its one and only session the same way."""
+        rc, out = self._run_rc("window", "new")
+        out = out.strip()
+        found = IT2_WINDOW_RE.search(out) if rc == 0 else None
+        if not found:
+            return False, out or "it2 window new failed"
+        session = next((r["guid"] for r in self.list_sessions() if r["window"] == found.group(1)), "")
+        if not session:
+            return False, f"{out}, but it2 lists no session in it to type into"
+        rc, typed = self._run_rc("session", "run", command, "--session", session)
+        return (True, out) if rc == 0 else (False, typed.strip() or "it2 session run failed")
 
     def new_tab(self, command: str, window: str = "") -> tuple[bool, str]:
         args = ["tab", "new"]
@@ -703,7 +733,7 @@ def attach_command(name: str, env) -> list[str]:
     return ["tmux", "attach", "-t", name]
 
 
-def cc_tab_command(name: str) -> str:
+def cc_tab_command(name: str, socket: str = "") -> str:
     """Command line for a fresh iTerm2 tab that attaches in control mode.
 
     `it2 tab new --command` does not run the string as the tab's process: it opens the profile's login shell
@@ -714,7 +744,13 @@ def cc_tab_command(name: str) -> str:
 
     The target keeps its quotes: zsh expands a bare `=word` to the path of the command `word` (the EQUALS
     option, on by default), so `-t =my-proj` aborts the whole line with "not found" and the tab silently
-    stays a plain shell. Only plain names are accepted: iTerm2 parses the string, then zsh does."""
+    stays a plain shell. Only plain names are accepted: iTerm2 parses the string, then zsh does.
+
+    `socket` adds the `-L` of a private server, so a tab opened for a restored test session attaches to
+    the server that session lives on instead of the user's."""
     if not valid_session_name(name):
         raise ValueError(f"session name {name!r} is not safe to put on a command line")
-    return f"""/bin/zsh -lc 'exec tmux -CC attach -t "={name}"'; exit"""
+    if socket and not SOCKET_NAME_RE.match(socket):
+        raise ValueError(f"not a tmux socket name: {socket!r}")
+    where = f"-L {socket} " if socket else ""
+    return f"""/bin/zsh -lc 'exec tmux {where}-CC attach -t "={name}"'; exit"""

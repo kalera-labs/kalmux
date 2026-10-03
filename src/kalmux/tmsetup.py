@@ -47,6 +47,8 @@ def state_dir(env: dict | None = None) -> Path:
 STATE_DIR = state_dir()
 STATUS_DIR = STATE_DIR / "status"                     # one <session_id>.json per Claude session (statusLine tap)
 TRACE_DIR = STATE_DIR / "trace"                       # one <session_id>.jsonl trail per Claude session (hook)
+SESSIONS_FILE = STATE_DIR / "sessions.json"           # the live tmux sessions, rewritten by the ui server
+PREVIOUS_SESSIONS_FILE = STATE_DIR / "sessions.previous.json"   # the list of the boot before this one
 # state written before a rename: migrated whole by `kalmux setup`, and still searched for a stale pidfile
 LEGACY_STATE_DIRS = (Path.home() / ".local/state/kmux", Path.home() / ".local/state/tm")
 ITERM_SCRIPTS = Path.home() / "Library/Application Support/iTerm2/Scripts"
@@ -468,6 +470,32 @@ def run_setup(dry_run: bool = False, ui: bool = True, statusline: bool = True, p
     return failures
 
 
+def check_session_snapshot(sessions_file: Path = SESSIONS_FILE, tmux=None, now=None, sleep=time.sleep) -> tuple[bool, str]:
+    """(ok, info) for the doctor's session-snapshot check: is the saved list this boot's live one?
+
+    Only the UI server snapshots right after an action; `kalmux new` / `kill` / `rename` (and a plain
+    `tmux new-session`) talk to tmux directly, so the file trails them by up to one keeper round. A
+    disagreement is therefore looked at twice before it is reported, or `kalmux new x && kalmux doctor`
+    would exit 1 on a perfectly healthy machine."""
+    # lazy, like the tmserver import above: `kalmux statusline` imports this module on every status-line
+    # refresh and must not pay for dataclasses/threading it never uses.
+    from .tmcore import Tmux
+    from .tmrestore import DRIFT_NOTE, SNAPSHOT_EVERY, boot_time, live_sessions, snapshot_health
+    server = Tmux() if tmux is None else tmux
+    clock, boot = now or time.time, boot_time()
+
+    def verdict() -> tuple[bool, str]:
+        live = live_sessions(server)
+        names = None if live is None else [s.name for s in live]
+        return snapshot_health(sessions_file, boot, names, int(clock()))
+
+    ok, info = verdict()
+    if ok or DRIFT_NOTE not in info:
+        return ok, info
+    sleep(SNAPSHOT_EVERY + 1)
+    return verdict()
+
+
 def _hook_commands(settings_path: Path) -> dict[str, list[str]]:
     hooks = json.loads(settings_path.read_text()).get("hooks", {})
     return {ev: [h.get("command", "") for g in groups for h in g.get("hooks", [])] for ev, groups in hooks.items()}
@@ -477,7 +505,7 @@ def doctor_checks(settings_path: Path = DEFAULT_SETTINGS, hook_link: Path = DEFA
                   tmux_conf: Path = DEFAULT_TMUX_CONF, defaults_reader=None, ui_health=None, autolaunch=None,
                   ui: bool = True, cli_link: Path = DEFAULT_TM_LINK, alias_links: tuple[Path, ...] = LEGACY_LINKS,
                   autolaunch_paths=None, state_dir: Path = STATE_DIR, statusline_status=None,
-                  statusline: bool = True, config_loader=None) -> list[dict]:
+                  statusline: bool = True, config_loader=None, snapshot_status=None) -> list[dict]:
     """ui=False (a machine set up with `kalmux setup --no-ui`) skips the toolbelt / AutoLaunch / server checks;
     statusline=False (`--no-statusline`) skips the two status-line checks the same way."""
     checks: list[dict] = []
@@ -561,4 +589,8 @@ def doctor_checks(settings_path: Path = DEFAULT_SETTINGS, hook_link: Path = DEFA
                 add("ui server runs this code", running == VERSION,
                     f"server {running}, checkout {VERSION}"
                     + ("" if running == VERSION else " — kalmux ui restart (from an iTerm2 shell)"))
+                # only while the server answers: it is the process that writes the file every 5 s
+                # state_dir, not the module default: a doctor pointed at another state dir reads that one
+                status = snapshot_status or (lambda: check_session_snapshot(state_dir / "sessions.json"))
+                add("session snapshot (restore after reboot)", *status())
     return checks

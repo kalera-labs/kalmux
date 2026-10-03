@@ -6,7 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from kalmux import tmserver, tmsetup
+from fakes import FakeTmux, pane
+from kalmux import tmrestore, tmserver, tmsetup
 
 
 def test_managed_block_has_passthrough_and_replay_hook():
@@ -265,7 +266,8 @@ def test_doctor_checks_full_report(tmp_path):
               "state_dir": tmp_path / "state",
               "statusline_status": lambda: {"routed": True, "command": "kalmux statusline", "saved_command": "bun hud.ts",
                                             "saved_present": True, "fresh": 1},
-              "config_loader": lambda: {"_errors": []}}
+              "config_loader": lambda: {"_errors": []},
+              "snapshot_status": lambda: (True, "3 session(s), 2s old")}
     healthy = {"pid": 42, "tmux": "/opt/homebrew/bin/tmux", "version": tmsetup.VERSION}
     report = tmsetup.doctor_checks(ui_health=lambda: healthy, autolaunch=lambda: "ours", **common)
     names = {c["name"]: c for c in report}
@@ -434,7 +436,8 @@ def test_doctor_checks_the_running_server_runs_this_code(tmp_path):
         return
     common = {"settings_path": tmp_path / "settings.json", "hook_link": tmp_path / "l", "wrapper": tmp_path / "w",
               "tmux_conf": tmp_path / "c", "defaults_reader": lambda key: "", "autolaunch": lambda: "missing",
-              "state_dir": tmp_path / "state", "statusline": False, "config_loader": lambda: {"_errors": []}}
+              "state_dir": tmp_path / "state", "statusline": False, "config_loader": lambda: {"_errors": []},
+              "snapshot_status": lambda: (True, "stub")}      # never the real tmux server from a test
     fresh = {c["name"]: c for c in tmsetup.doctor_checks(
         ui_health=lambda: {"pid": 1, "tmux": "/opt/homebrew/bin/tmux", "version": tmsetup.VERSION}, **common)}
     assert fresh["ui server runs this code"]["ok"] is True and tmsetup.VERSION in fresh["ui server runs this code"]["info"]
@@ -442,6 +445,87 @@ def test_doctor_checks_the_running_server_runs_this_code(tmp_path):
         ui_health=lambda: {"pid": 1, "tmux": "/opt/homebrew/bin/tmux", "version": "0.0.1"}, **common)}
     check = stale["ui server runs this code"]
     assert check["ok"] is False and "0.0.1" in check["info"] and "kalmux ui restart" in check["info"]
+
+
+def test_doctor_reports_the_session_snapshot_of_the_running_server(tmp_path, monkeypatch):
+    """The snapshot is what brings the sessions back after a reboot: if it quietly stops being written,
+    nothing else notices until the next reboot has already lost them."""
+    if os.uname().sysname != "Darwin":
+        return
+    common = {"settings_path": tmp_path / "settings.json", "hook_link": tmp_path / "l", "wrapper": tmp_path / "w",
+              "tmux_conf": tmp_path / "c", "defaults_reader": lambda key: "", "autolaunch": lambda: "missing",
+              "state_dir": tmp_path / "state", "statusline": False, "config_loader": lambda: {"_errors": []},
+              "ui_health": lambda: {"pid": 1, "tmux": "/opt/homebrew/bin/tmux", "version": tmsetup.VERSION}}
+    name = "session snapshot (restore after reboot)"
+    green = {c["name"]: c for c in tmsetup.doctor_checks(snapshot_status=lambda: (True, "2 session(s), 3s old"), **common)}
+    assert green[name]["ok"] is True and "2 session(s)" in green[name]["info"]
+    red = {c["name"]: c for c in tmsetup.doctor_checks(snapshot_status=lambda: (False, "sessions.json missing"), **common)}
+    assert red[name]["ok"] is False and "missing" in red[name]["info"]
+    # a server that does not answer is already reported on its own line: no snapshot check at all
+    down = {c["name"] for c in tmsetup.doctor_checks(**{**common, "ui_health": lambda: None})}
+    assert name not in down
+    # without injection the default is wired, and it reads the state dir it was given — never ~/.local/state
+    # and never the user's tmux server (that is why the real function is stubbed out here, not called)
+    asked = []
+    monkeypatch.setattr(tmsetup, "check_session_snapshot", lambda f: asked.append(f) or (True, "stub"))
+    live = {c["name"]: c for c in tmsetup.doctor_checks(**common)}
+    assert live[name]["info"] == "stub" and asked == [tmp_path / "state" / "sessions.json"]
+
+
+def snapshot_tmux(*names):
+    """A FakeTmux holding one pane per session name, the way tmrestore reads it."""
+    return FakeTmux(panes=[pane(n, pane_id=f"%{i}", path=f"/Volumes/Dev/{n}") for i, n in enumerate(names)])
+
+
+def write_sessions(path, boot, *names):
+    sessions = tuple(tmrestore.SavedSession(name=n, cwd="/tmp", created=1000 + i) for i, n in enumerate(names))
+    tmrestore.write_snapshot(path, tmrestore.Snapshot(boot=boot, saved_at=1, sessions=sessions))
+    return path
+
+
+def test_check_session_snapshot_reads_the_file_against_the_live_sessions(tmp_path, monkeypatch):
+    monkeypatch.setattr(tmrestore, "boot_time", lambda: 7)
+    path = write_sessions(tmp_path / "sessions.json", 7, "api", "web")
+    slept = []
+    ok, info = tmsetup.check_session_snapshot(path, tmux=snapshot_tmux("web", "api"), sleep=slept.append)
+    assert ok is True and "2 session(s)" in info and slept == []
+
+
+def test_check_session_snapshot_looks_again_before_calling_the_write_lag_a_drift(tmp_path, monkeypatch):
+    """`kalmux new foo` talks to tmux directly, so the file lags up to one keeper round: a doctor run in
+    that window must not turn red (and make `kalmux doctor` exit 1) over a snapshot that is simply next."""
+    monkeypatch.setattr(tmrestore, "boot_time", lambda: 7)
+    path = write_sessions(tmp_path / "sessions.json", 7, "api")
+    tmux = snapshot_tmux("api", "foo")
+    slept = []
+
+    def keeper_round(seconds):
+        slept.append(seconds)
+        write_sessions(path, 7, "api", "foo")                # the keeper's next tick catches up
+
+    ok, info = tmsetup.check_session_snapshot(path, tmux=tmux, sleep=keeper_round)
+    assert ok is True and slept == [tmrestore.SNAPSHOT_EVERY + 1]
+    assert "out of step" not in info
+
+
+def test_check_session_snapshot_still_reports_a_drift_that_does_not_heal(tmp_path, monkeypatch):
+    monkeypatch.setattr(tmrestore, "boot_time", lambda: 7)
+    path = write_sessions(tmp_path / "sessions.json", 7, "api")
+    slept = []
+    ok, info = tmsetup.check_session_snapshot(path, tmux=snapshot_tmux("api", "foo"), sleep=slept.append)
+    assert ok is False and "foo" in info and len(slept) == 1
+
+
+def test_check_session_snapshot_does_not_wait_for_a_file_that_is_simply_missing(tmp_path, monkeypatch):
+    monkeypatch.setattr(tmrestore, "boot_time", lambda: 7)
+    slept = []
+    ok, info = tmsetup.check_session_snapshot(tmp_path / "none.json", tmux=snapshot_tmux("api"), sleep=slept.append)
+    assert ok is False and "missing" in info and slept == []
+
+
+def test_the_session_files_live_in_the_state_dir():
+    assert tmsetup.SESSIONS_FILE == tmsetup.STATE_DIR / "sessions.json"
+    assert tmsetup.PREVIOUS_SESSIONS_FILE == tmsetup.STATE_DIR / "sessions.previous.json"
 
 
 def test_the_statusline_step_refuses_a_tm_link_that_is_not_executable(tmp_path, monkeypatch):
