@@ -1,239 +1,159 @@
-"""tmrestore — remember the live tmux sessions, and bring them back after a reboot.
+"""tmrestore — bring the tmux sessions back when the server that held them is gone.
 
-A reboot kills the tmux server with every session in it, and nothing restores them today. Quitting iTerm2
-only DETACHES its control-mode clients (iTerm2 3.7.3 sends no tmux command on quit), so a session that
-disappears while the machine is up was really killed, while one that disappears across a reboot was not.
-That is the whole difference this module records: the UI server, the only long-lived Kalmux process, keeps
-the live list in ${STATE}/sessions.json, and the first server of a NEW boot (`kern.boottime`, not "the
-tmux server is down": `kalmux ui restart` is not a reboot) recreates what the previous boot still had open.
+A reboot kills the tmux server with every session in it, and so does an iTerm2 crash: AutoLaunch starts
+the Kalmux server and the Kalmux server starts tmux, so all three share iTerm2's macOS resource coalition
+and go down together (verified from the system log on 2026-10-04). Quitting iTerm2 only DETACHES its
+clients, and killing a session is the user saying so, so what decides a restore here is narrower than
+"the sessions are gone": it is WHICH tmux server the saved list describes (tmsnapshot writes it down).
 
-Name, directory and color come back, one iTerm2 tab each — no windows, no panes, no processes and no
-conversation. A restored session is a shell in the right directory, so `claude --continue` picks the
-conversation up from there.
+The UI server, the only long-lived Kalmux process, keeps that list up to date. When it has sessions and
+the server that wrote it is not the one answering now — nothing is running, or another server took the
+socket — those sessions were not killed, and they come back: at startup, and on any keeper round that
+sees the change. Name, directory and color, one iTerm2 tab each; no windows, no panes, no processes, no
+conversation. A restored session is a shell in the right directory, which `claude --continue` needs.
 """
 from __future__ import annotations
 
 import contextlib
-import json
 import os
-import re
-import subprocess
 import sys
-import tempfile
 import threading
 import time
-from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
-from .tmcore import CTRL_RE, HEX_RE, IT2_WINDOW_RE, SEP, It2, Tmux, cc_tab_command, fmt_age, valid_session_name
+from .tmcore import CTRL_RE, IT2_WINDOW_RE, It2, Tmux, cc_tab_command, fmt_age, valid_session_name
+from .tmsnapshot import (
+    LiveState,
+    SavedSession,
+    Snapshot,
+    boot_time,
+    copy_snapshot,
+    live_state,
+    read_snapshot,
+    write_snapshot,
+)
 
-SNAPSHOT_VERSION = 1
 SNAPSHOT_EVERY = 5.0             # seconds between two rounds of the keeper thread
-UNREACHABLE_GRACE = 30.0         # how long tmux must stay silent before an empty list is believed
-BOOT_COMMAND = ("/usr/sbin/sysctl", "-n", "kern.boottime")
-BOOT_RE = re.compile(r"sec\s*=\s*(\d+)")      # "{ sec = 1790848664, usec = 496772 } Tue Sep 30 21:37:44 2026"
-SESSION_FMT = SEP.join(["#{session_name}", "#{pane_current_path}", "#{@tm_color}", "#{session_created}"])
-MAX_CWD = 1024
-MAX_SESSIONS = 200               # a bound on what one file can ask the server to create at startup
 DRIFT_NOTE = "out of step with tmux"                     # the doctor re-reads once before believing this one
-
-# One SESSION_FMT record. The records are newline-separated, but #{pane_current_path} is whatever the
-# directory is called — macOS allows a newline in there — so only the cwd field may span lines, and the
-# other three anchor where a record really starts and ends.
-_PLAIN = rf"[^{SEP}\n]*"
-SESSION_RECORD_RE = re.compile(rf"({_PLAIN}){SEP}([^{SEP}]*?){SEP}({_PLAIN}){SEP}(\d*)(?:\n|\Z)", re.S)
+STOPPED_NOTE = "restore: stopped: the ui server is shutting down; the next start finishes the restore"
 
 
 def _quiet(_message: str) -> None:
     """Default log sink: the server passes its own stream, the CLI prints, tests collect."""
 
 
-# ----------------------------------------------------------------------------- boot time
-def _sysctl(cmd: list[str]) -> tuple[int, str]:
-    try:
-        p = subprocess.run(cmd, capture_output=True, check=False, timeout=5)
-    except (OSError, subprocess.SubprocessError):
-        return 127, ""
-    return p.returncode, p.stdout.decode("utf-8", "replace")
+def _never() -> bool:
+    """Default stop predicate: a restore nothing can interrupt (`kalmux restore` on the command line)."""
+    return False
 
 
-def boot_time(runner: Callable[[list[str]], tuple[int, str]] | None = None) -> int:
-    """The second this kernel booted, or 0 when it cannot be read (non-macOS included).
+# ----------------------------------------------------------------------------- the one rule
+def restore_due(stored: Snapshot | None, live: LiveState | None, boot: int) -> bool:
+    """Do the saved sessions need bringing back? The one rule, used at startup and on every keeper round.
 
-    0 means "unknown" and disables the restore on both sides of the comparison: a wrong "this is a new
-    boot" would recreate sessions that are still running under those names."""
-    rc, out = (runner or _sysctl)(list(BOOT_COMMAND))
-    found = BOOT_RE.search(out) if rc == 0 else None
-    return int(found.group(1)) if found else 0
+    Due when the list has sessions and the server that wrote it is not the one answering now: nothing is
+    running (a reboot, or a tmux that died and nobody restarted it), or another server holds the socket
+    (an iTerm2 crash took tmux down, and something started a new one). Killing a session is a list that
+    shrinks under the SAME server, and is never due.
 
-
-# ----------------------------------------------------------------------------- the records
-@dataclass(frozen=True)
-class SavedSession:
-    """One line of the snapshot: everything a restore can bring back."""
-
-    name: str
-    cwd: str = ""
-    color: str = ""
-    created: int = 0
-
-    def as_dict(self) -> dict:
-        return {"name": self.name, "cwd": self.cwd, "color": self.color, "created": self.created}
-
-
-@dataclass(frozen=True)
-class Snapshot:
-    """The whole file: which boot these sessions belonged to, and when the list was taken."""
-
-    boot: int
-    saved_at: int
-    sessions: tuple[SavedSession, ...] = ()
-
-    @property
-    def names(self) -> tuple[str, ...]:
-        return tuple(s.name for s in self.sessions)
-
-    def as_dict(self) -> dict:
-        return {"version": SNAPSHOT_VERSION, "boot": self.boot, "saved_at": self.saved_at,
-                "sessions": [s.as_dict() for s in self.sessions]}
-
-
-def _record(name: str, cwd: str, color: str, created) -> SavedSession | None:
-    """One validated record, or None when the name is not one tmux (or a tab command line) can carry."""
-    if not valid_session_name(name):
-        return None
-    return SavedSession(name=name, cwd=str(cwd)[:MAX_CWD], color=color if HEX_RE.match(color or "") else "",
-                        created=int(created) if str(created).isdigit() else 0)
-
-
-# ----------------------------------------------------------------------------- reading tmux
-def live_sessions(tmux: Tmux) -> tuple[SavedSession, ...] | None:
-    """The live sessions in creation order, or None when tmux does not answer.
-
-    None is not an empty list: with no server running `list-sessions` exits 1, and writing [] for that
-    would erase the very list a reboot needs (hence the Snapshotter's grace period)."""
-    rc, out = tmux.run_rc("list-sessions", "-F", SESSION_FMT)
-    if rc != 0:
-        return None
-    # tmux does not escape its data, so a record that does not match whole is never guessed at
-    rows = [row for match in SESSION_RECORD_RE.finditer(out) if (row := _record(*match.groups())) is not None]
-    rows.sort(key=lambda s: (s.created, s.name))
-    return tuple(rows[:MAX_SESSIONS])
-
-
-# ----------------------------------------------------------------------------- the file
-def _is_int(value) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool)
-
-
-def _records(raw: list) -> Iterator[SavedSession]:
-    for item in raw[:MAX_SESSIONS]:
-        if not isinstance(item, dict):
-            continue
-        row = _record(str(item.get("name", "")), str(item.get("cwd") or ""), str(item.get("color") or ""),
-                      item.get("created") if _is_int(item.get("created")) else 0)
-        if row is not None:
-            yield row
-
-
-def read_snapshot(path: Path) -> Snapshot | None:
-    """The saved list, or None when the file is missing, unreadable or not one of ours.
-
-    The file is ours, but it is still parsed like external data: it decides what the server creates at
-    startup, and a state directory is not a place anything should be trusted blindly."""
-    try:
-        data = json.loads(Path(path).read_text(encoding="utf-8", errors="replace"))
-    except (OSError, ValueError):
-        return None
-    if not isinstance(data, dict) or data.get("version") != SNAPSHOT_VERSION:
-        return None
-    boot, saved_at, raw = data.get("boot"), data.get("saved_at"), data.get("sessions")
-    if not _is_int(boot) or not _is_int(saved_at) or not isinstance(raw, list):
-        return None
-    return Snapshot(boot=boot, saved_at=saved_at, sessions=tuple(_records(raw)))
-
-
-def write_snapshot(path: Path, snap: Snapshot) -> bool:
-    """Replace the file atomically (temp + os.replace), 0600 inside a 0700 directory.
-
-    It lists every project the user has open, so it is created private from the first byte rather than
-    chmod-ed afterwards (mkstemp opens 0600). The temp name is unique per writer: a shared one is a
-    shared, truncated buffer, and two writers in it rename a half-and-half file into place. Returns
-    False on any OSError: a snapshot is never worth an exception."""
-    path = Path(path)
-    raw = json.dumps(snap.as_dict(), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    tmp = ""
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
-        try:
-            os.write(fd, raw)
-        finally:
-            os.close(fd)
-        os.replace(tmp, path)
-    except OSError:
-        if tmp:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp)
+    A version-1 file carries no identity, so the 0.5.0 rule still decides for it: only a new boot counts,
+    and an unknown boot on either side decides nothing — recreating sessions that are still running under
+    those names is the one outcome worse than restoring nothing."""
+    if stored is None or not stored.sessions:
         return False
-    return True
-
-
-def copy_snapshot(path: Path, destination: Path) -> bool:
-    """Keep the previous boot's list under its own name before the restore touches anything."""
-    snap = read_snapshot(path)
-    return write_snapshot(destination, snap) if snap is not None else False
+    if live is None:
+        return True
+    if stored.server is not None:
+        return stored.server != live.server
+    return bool(boot and stored.boot and stored.boot != boot)
 
 
 class Snapshotter:
-    """Keeps one snapshot file in step with the live sessions, writing only when the list changed.
+    """Keeps one snapshot file in step with the live sessions, writing only when something changed.
 
     Three threads drive one instance — the keeper's own loop, an HTTP handler right after an action that
     changed the list, and the main thread's final() in the SIGTERM handler — so every round runs under
-    this object's own lock. Never the server's: the handler already holds that one when it calls in, and
-    a tmux round trip every 5 s under it would stall every request."""
+    this object's own lock. Never the server's: the handler already holds that one when it calls in.
+
+    LOCK ORDER: the server's lock is always taken BEFORE this one (Backend.do holds it while _kept() ->
+    run_once() calls in), so nothing here may wait for the server's lock while holding this one — hence
+    `on_lost` fires after the lock is released, with the lost snapshot handed over by value. It must also
+    return at once (the keeper hands the restore to a thread of its own): the round it interrupts can be
+    an HTTP request, and no request may wait for sessions to be recreated and tabs to open."""
 
     def __init__(self, path: Path, tmux: Tmux, boot: int, clock: Callable[[], float] = time.time,
-                 grace: float = UNREACHABLE_GRACE, log: Callable[[str], None] = _quiet) -> None:
+                 log: Callable[[str], None] = _quiet, previous_path: Path | None = None,
+                 on_lost: Callable[[Snapshot], None] | None = None) -> None:
         self.path = Path(path)
-        self.tmux, self.boot, self.clock, self.grace, self.log = tmux, boot, clock, grace, log
+        self.previous_path = Path(previous_path) if previous_path else self.path.with_suffix(".previous.json")
+        self.tmux, self.boot, self.clock, self.log, self.on_lost = tmux, boot, clock, log, on_lost
         self._lock = threading.Lock()
         self._last: tuple[SavedSession, ...] | None = None
-        self._unreachable_since: float | None = None
+        # What the file holds, read from disk rather than left empty: the server restart this has to
+        # notice happens BEFORE the first round, and an instance that only knew its own writes would
+        # compare the new server against nothing and see no change at all.
+        self._stored: Snapshot | None = read_snapshot(self.path)
 
     def tick(self, force: bool = False) -> bool:
-        """One round. True when the file was written."""
+        """One round. True when the file was written; a list left behind by a server that is gone is
+        handed to `on_lost` afterwards, outside the lock."""
         with self._lock:
-            sessions = live_sessions(self.tmux)
-            if sessions is None:
-                return self._tick_unreachable()
-            self._unreachable_since = None
-            return self._write(sessions) if force or sessions != self._last else False
+            state = live_state(self.tmux)
+            if state is None:
+                # No server answers, so there is no list to write: an iTerm2 crash takes tmux down with
+                # every session still in it, and 0.5.0 lost exactly that list here, writing [] after 30 s.
+                return False
+            if not (force or self._changed(state)):
+                return False
+            lost = self._lost_list(state)
+            self._keep_previous(state)
+            wrote = self._write(state)
+        if wrote and lost is not None and self.on_lost is not None:
+            self.on_lost(lost)
+        return wrote
 
     def final(self) -> bool:
         """The last snapshot before the server stops, skipped unless tmux still answers: it closes the
         5 s window at shutdown without ever replacing a good list with an empty one."""
         with self._lock:
-            sessions = live_sessions(self.tmux)
-            return self._write(sessions) if sessions is not None else False
+            state = live_state(self.tmux)
+            if state is None:
+                return False
+            self._keep_previous(state)
+            return self._write(state)
 
-    def _tick_unreachable(self) -> bool:
-        """tmux is gone. At a shutdown every process gets SIGTERM at once and this one dies long before
-        the grace period is up, so the last good list survives the reboot; only a server that stays
-        unreachable means the user killed the last session and `exit-empty` stopped it."""
-        now = self.clock()
-        if self._unreachable_since is None:
-            self._unreachable_since = now
-        if now - self._unreachable_since < self.grace or self._last == ():
-            return False
-        return self._write(())
+    def _changed(self, state: LiveState) -> bool:
+        """A different list, or the same list from another server (recorded too, so that a restore
+        already done stops being reported as pending)."""
+        return state.sessions != self._last or (self._stored is not None and self._stored.server != state.server)
 
-    def _write(self, sessions: tuple[SavedSession, ...]) -> bool:
-        if not write_snapshot(self.path, Snapshot(boot=self.boot, saved_at=int(self.clock()), sessions=sessions)):
+    def _lost_list(self, state: LiveState) -> Snapshot | None:
+        """The stored list when its server is gone and it holds names this one does not: the in-flight
+        restore (tmux died, the ui server lived on, a new tmux took the socket)."""
+        stored = self._stored
+        if stored is None or not restore_due(stored, state, self.boot):
+            return None
+        here = {s.name for s in state.sessions}
+        return stored if any(s.name not in here for s in stored.sessions) else None
+
+    def _keep_previous(self, state: LiveState) -> None:
+        """Before the file stops describing the old server, put its list where `kalmux restore` can still
+        find it — whether or not the automatic restore is on: the copy is what makes the manual one work.
+
+        The same rule that decides a restore decides the copy, so a version-1 file (no identity, never
+        equal to a live server) on an unchanged boot — the one case where nothing can be shown to be lost
+        — leaves the previous copy alone instead of overwriting it with a list that is still running."""
+        stored = self._stored
+        if stored is not None and restore_due(stored, state, self.boot):
+            copy_snapshot(self.path, self.previous_path)
+
+    def _write(self, state: LiveState) -> bool:
+        snap = Snapshot(boot=self.boot, saved_at=int(self.clock()), sessions=state.sessions, server=state.server)
+        if not write_snapshot(self.path, snap):
             self.log(f"restore: could not write {self.path}; the saved session list is now behind")
             return False
-        self._last = sessions
+        self._last, self._stored = state.sessions, snap
         return True
 
 
@@ -255,14 +175,19 @@ def _destination(session: SavedSession, home: str) -> tuple[str, str]:
 
 
 def restore(tmux: Tmux, sessions: Sequence[SavedSession], lock: threading.Lock | None = None,
-            log: Callable[[str], None] = _quiet, home: str = "") -> list[str]:
+            log: Callable[[str], None] = _quiet, home: str = "", stop: Callable[[], bool] = _never) -> list[str]:
     """Recreate the saved sessions that are not there any more; returns the names created, in order.
 
     A name that is taken is never stolen and never renamed: whatever runs under it now wins. The lock is
-    the server's own, held around the tmux calls only (a few ms per session), never around the tabs."""
+    the server's own, held around the tmux calls only (a few ms per session), never around the tabs.
+    `stop` ends the run between two sessions: a shutdown must not keep creating things, and the list on
+    disk is left untouched so the next start picks the restore up where this one stopped."""
     home = home or os.path.expanduser("~")
     created: list[str] = []
     for s in sessions:
+        if stop():
+            log(STOPPED_NOTE)
+            break
         if not valid_session_name(s.name):
             log(f"restore: skipped {s.name!r}: not a session name kalmux can create")
             continue
@@ -311,7 +236,8 @@ def _window_just_opened(it2: It2, out: str) -> str:
     return _window_id(out) or next(iter(it2.list_windows()), "")
 
 
-def open_tabs(it2: It2, names: Sequence[str], socket: str = "", log: Callable[[str], None] = _quiet) -> int:
+def open_tabs(it2: It2, names: Sequence[str], socket: str = "", log: Callable[[str], None] = _quiet,
+              stop: Callable[[], bool] = _never) -> int:
     """One control-mode tab per restored session; returns how many opened.
 
     Right after a reboot there is no iTerm2 window at all (AutoLaunch runs before the first window, and
@@ -325,6 +251,9 @@ def open_tabs(it2: It2, names: Sequence[str], socket: str = "", log: Callable[[s
         return 0
     window, opened, said = it2.current_window() or next(iter(it2.list_windows()), ""), 0, False
     for name in names:
+        if stop():
+            log(STOPPED_NOTE)
+            break
         try:
             command = cc_tab_command(name, socket)
         except ValueError as exc:
@@ -347,36 +276,49 @@ def _report(ran: bool, reason: str, created: Sequence[str] = (), tabs: int = 0) 
     return {"ran": ran, "reason": reason, "created": list(created), "tabs": tabs}
 
 
+def _why(snap: Snapshot, live: LiveState | None, boot: int) -> str:
+    """The reason a restore is running, for ui.log: which of the three cases this is."""
+    if live is None:
+        return "no tmux server is running"
+    if snap.server is not None:
+        return f"another tmux server holds the socket (saved under pid {snap.server.pid}, live pid {live.server.pid})"
+    return f"boot {boot} is new (the saved list took boot {snap.boot})"
+
+
 def restore_on_start(tmux: Tmux, it2: It2, path: Path, previous_path: Path, boot: int, enabled: bool = True,
-                     lock: threading.Lock | None = None, log: Callable[[str], None] = _quiet) -> dict:
-    """Decide, keep a copy, recreate: everything the first server of a new boot does before it snapshots.
+                     lock: threading.Lock | None = None, log: Callable[[str], None] = _quiet,
+                     stop: Callable[[], bool] = _never) -> dict:
+    """Decide, keep a copy, recreate: everything a starting ui server does before its first snapshot.
 
     The copy is made even when the automatic restore is off, so `kalmux restore` still has the list after
-    the server has overwritten sessions.json with the (empty) state of this boot."""
+    the server has overwritten sessions.json with the state of the tmux server that runs now."""
     snap = read_snapshot(path)
     if snap is None:
         return _report(False, f"no saved session list at {path}")
-    if not boot or not snap.boot or snap.boot == boot:
-        return _report(False, f"not a new boot (this boot {boot}, saved under {snap.boot})")
+    live = live_state(tmux)
+    if not restore_due(snap, live, boot):
+        return _report(False, f"the saved list belongs to the tmux server that is running "
+                              f"(this boot {boot}, saved under {snap.boot})")
     copy_snapshot(path, previous_path)
     if not enabled:
         log(f"restore: [restore] enabled = false; {len(snap.sessions)} saved session(s) kept in {previous_path}")
         return _report(False, "[restore] enabled = false")
-    log(f"restore: boot {boot} is new (snapshot took boot {snap.boot}); {len(snap.sessions)} session(s) to bring back")
-    created = restore(tmux, snap.sessions, lock=lock, log=log)
-    tabs = open_tabs(it2, created, socket=getattr(tmux, "socket", ""), log=log)
+    log(f"restore: {_why(snap, live, boot)}; {len(snap.sessions)} session(s) to bring back")
+    created = restore(tmux, snap.sessions, lock=lock, log=log, stop=stop)
+    tabs = open_tabs(it2, created, socket=getattr(tmux, "socket", ""), log=log, stop=stop)
     log(f"restore: {len(created)} session(s) recreated, {tabs} tab(s) opened")
     return _report(True, "restored", created, tabs)
 
 
-def restore_source(path: Path, previous_path: Path, boot: int) -> tuple[Snapshot | None, Path | None]:
+def restore_source(path: Path, previous_path: Path, live: LiveState | None,
+                   boot: int) -> tuple[Snapshot | None, Path | None]:
     """The list `kalmux restore` should use, and the file it came from.
 
-    A sessions.json still carrying another boot means the server has not started since the reboot, so it
-    IS the previous boot's list; once the server has rewritten it for this boot, the copy it took first
-    (sessions.previous.json) is the one that still holds what was open."""
+    A sessions.json whose server is not the live one is the lost list itself: no ui server has rewritten
+    it since the crash (or the reboot). Once the live server owns the file, the copy taken just before
+    that write — sessions.previous.json — is the one that still holds what was open."""
     current = read_snapshot(path)
-    if current is not None and current.boot and current.boot != boot:
+    if current is not None and restore_due(current, live, boot):
         return current, Path(path)
     previous = read_snapshot(previous_path)
     if previous is not None:
@@ -386,7 +328,8 @@ def restore_source(path: Path, previous_path: Path, boot: int) -> tuple[Snapshot
 
 # ----------------------------------------------------------------------------- the server's thread
 class SessionKeeper:
-    """Restore once at startup, then snapshot every SNAPSHOT_EVERY seconds until the server stops.
+    """Restore once at startup, then snapshot every SNAPSHOT_EVERY seconds until the server stops, and
+    restore again on any round where the tmux server turns out to have been replaced.
 
     Built only by `kalmux ui serve` (production): a Backend in a test must never start a thread that
     writes the real state directory."""
@@ -397,20 +340,63 @@ class SessionKeeper:
         self.boot = boot_time() if boot is None else boot
         self.tmux, self.it2, self.previous_path = tmux, it2, Path(previous_path)
         self.enabled, self.lock, self.out, self.every = enabled, lock, out, every
-        self.snapshotter = Snapshotter(path, tmux, self.boot, clock, log=self.log)
+        # `[restore] enabled = false` still records the list, still keeps the copy of a lost one (the
+        # Snapshotter does both) and still says so in ui.log; only the recreating is off.
+        self.snapshotter = Snapshotter(path, tmux, self.boot, clock, log=self.log, previous_path=self.previous_path,
+                                       on_lost=self._restore_lost if enabled else self._note_lost)
         self.thread: threading.Thread | None = None
+        self.restorer: threading.Thread | None = None
         self._stop = threading.Event()
+        # Held by whatever is restoring right now (startup or an in-flight round), so the final snapshot
+        # at SIGTERM can tell a half-finished restore from a quiet server and leave the saved list alone.
+        self._busy = threading.Lock()
 
     def log(self, message: str) -> None:
         print(message, file=self.out or sys.stdout, flush=True)
 
     def startup(self) -> dict:
-        """Restore (when this is a new boot), then record the list for THIS boot even when it is empty,
-        so a later `kalmux ui restart` does not run the restore a second time."""
+        """Restore (when the saved list's server is gone), then record the list of the server running
+        now even when it is empty, so neither a later `ui restart` nor the next round restores twice.
+
+        Nothing is recorded when the shutdown arrived mid-restore: the list that is still lost has to
+        stay lost on disk, or the next start sees a file that matches the live server and gives up."""
         report = restore_on_start(self.tmux, self.it2, self.snapshotter.path, self.previous_path, self.boot,
-                                  enabled=self.enabled, lock=self.lock, log=self.log)
+                                  enabled=self.enabled, lock=self.lock, log=self.log, stop=self._stop.is_set)
+        if self._stop.is_set():
+            return report
         self.snapshotter.tick(force=True)
         return report
+
+    def _note_lost(self, stored: Snapshot) -> None:
+        """The same round with the automatic restore off: nothing is recreated, but a list lost without a
+        word is how the 0.5.0 crash went unnoticed, so ui.log says what was kept and where."""
+        self.log(f"restore: the tmux server changed; [restore] enabled = false; {len(stored.sessions)} session(s) "
+                 f"kept in {self.previous_path} (kalmux restore)")
+
+    def _restore_lost(self, stored: Snapshot) -> None:
+        """A snapshot round found the saved list's server replaced: bring back what the new one lacks.
+
+        On a thread of its own, because a round is ticked from the keeper's loop AND from inside an HTTP
+        request that holds the server's lock (Backend.do -> _kept -> run_once): recreating sessions and
+        opening a tab each is seconds of it2 calls, and neither that request nor the actions queued
+        behind that lock may wait for them. The new thread holds no caller lock, so it can take the
+        server's own around the tmux calls, exactly like the startup path. Guarded: a tmux hiccup there
+        must take down neither the keeper nor the ui server."""
+        self.restorer = threading.Thread(target=self._guarded, args=(lambda: self._bring_back(stored),),
+                                         name="kalmux-restore", daemon=True)
+        self.restorer.start()
+
+    def _bring_back(self, stored: Snapshot) -> None:
+        """The in-flight restore itself, on the thread _restore_lost started: never call this inline from
+        a thread holding the server's lock — `_busy` can be held by a startup that is waiting for it."""
+        with self._busy:
+            if self._stop.is_set():
+                return
+            self.log(f"restore: the tmux server changed; {len(stored.sessions)} session(s) saved under the old one")
+            created = restore(self.tmux, stored.sessions, lock=self.lock, log=self.log, stop=self._stop.is_set)
+            tabs = open_tabs(self.it2, created, socket=getattr(self.tmux, "socket", ""), log=self.log,
+                             stop=self._stop.is_set)
+            self.log(f"restore: {len(created)} session(s) recreated, {tabs} tab(s) opened")
 
     def run_once(self) -> bool:
         """One snapshot round, from the thread or straight after an action that changed the list."""
@@ -422,12 +408,26 @@ class SessionKeeper:
         return self.thread
 
     def stop(self) -> None:
-        """Wake the thread and take the final snapshot (SIGTERM, i.e. `kalmux ui stop` or a shutdown)."""
+        """Wake the thread and take the final snapshot (SIGTERM, i.e. `kalmux ui stop` or a shutdown).
+
+        Never while a restore is running: the restoring thread is a daemon and dies with the interpreter,
+        and a final snapshot taken half-way through would record the handful of sessions recreated so far
+        as this server's own list. The next start would then find nothing to restore and the rest would
+        be gone. Leaving the file as it is costs the last few seconds of session changes and keeps the
+        restore pending, which is the one of the two the next start can still fix."""
         self._stop.set()
-        self._guarded(self.snapshotter.final)
+        if not self._busy.acquire(blocking=False):
+            self.log("restore: a restore is in flight; the final snapshot is skipped so the next start finishes it")
+            return
+        try:
+            self._guarded(self.snapshotter.final)
+        finally:
+            self._busy.release()
 
     def _loop(self) -> None:
-        self._guarded(self.startup)
+        with self._busy:                           # a stop during the startup restore skips final()
+            if not self._stop.is_set():
+                self._guarded(self.startup)
         while not self._stop.wait(self.every):     # an Event, so a stop does not wait out the interval
             self._guarded(self.run_once)
 
@@ -441,19 +441,26 @@ class SessionKeeper:
 
 
 # ----------------------------------------------------------------------------- doctor
-def snapshot_health(path: Path, boot: int, live: Sequence[str] | None, now: int) -> tuple[bool, str]:
-    """(ok, info) for `kalmux doctor`: does the saved list still describe this boot's live sessions?
+def snapshot_health(path: Path, boot: int, live: LiveState | None, now: int) -> tuple[bool, str]:
+    """(ok, info) for `kalmux doctor`: does the saved list still describe the live tmux server?
 
     A snapshot that quietly stopped being written is exactly how the Claude trail broke for three weeks
     without anyone noticing, so the freshness of this file is a check of its own. A DRIFT_NOTE verdict
     is the one the caller re-reads after a keeper round: only the UI asks for an immediate snapshot, so
-    `kalmux new` on the command line leaves the file behind for up to SNAPSHOT_EVERY seconds."""
+    `kalmux new` on the command line leaves the file behind for up to SNAPSHOT_EVERY seconds. A list
+    whose server is gone is a restore that has not happened — the names can agree and still be wrong,
+    and so can a tmux that is not running at all, which is exactly when this check is consulted."""
     snap = read_snapshot(path)
     if snap is None:
         return False, f"{path} missing or unreadable (the ui server writes it every {int(SNAPSHOT_EVERY)}s)"
     info = f"{len(snap.sessions)} session(s), {fmt_age(max(0, now - snap.saved_at))} old, {path}"
     if boot and snap.boot != boot:
         return False, f"{info} — saved under boot {snap.boot}, this machine booted at {boot}"
-    if live is not None and set(live) != set(snap.names):
-        return False, f"{info} — {DRIFT_NOTE}: {', '.join(sorted(set(live) ^ set(snap.names)))}"
+    if restore_due(snap, live, boot):
+        return False, f"{info} — restore pending: {_why(snap, live, boot)} (kalmux restore)"
+    if live is None:
+        return True, info                        # nothing saved and no server: nothing is waiting to happen
+    names = {s.name for s in live.sessions}
+    if names != set(snap.names):
+        return False, f"{info} — {DRIFT_NOTE}: {', '.join(sorted(names ^ set(snap.names)))}"
     return True, info

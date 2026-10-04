@@ -7,12 +7,14 @@ from pathlib import Path
 import pytest
 
 from fakes import FakeTmux, pane
-from kalmux import tmrestore, tmserver, tmsetup
+from kalmux import tmrestore, tmserver, tmsetup, tmsnapshot
 
 
 def test_managed_block_has_passthrough_and_replay_hook():
     block = tmsetup.managed_block(Path("/Users/x/.local/bin/tm"))
     assert "set -g allow-passthrough on" in block
+    # without it, killing the LAST session stops the server, which is exactly what a crash looks like
+    assert "set -s exit-empty off" in block
     assert "set-hook -g client-attached 'run-shell -b \"sleep 2; /Users/x/.local/bin/tm reapply >/dev/null 2>&1 || true\"'" in block
     assert block.startswith(tmsetup.MANAGED_BEGIN) and block.rstrip().endswith(tmsetup.MANAGED_END)
 
@@ -272,6 +274,7 @@ def test_doctor_checks_full_report(tmp_path):
     report = tmsetup.doctor_checks(ui_health=lambda: healthy, autolaunch=lambda: "ours", **common)
     names = {c["name"]: c for c in report}
     assert names["hook symlink -> wrapper"]["ok"] and names["key hook events wired"]["ok"] and names["tmux.conf client-attached hook (status replay)"]["ok"]
+    assert names[tmsetup.EXIT_EMPTY_CHECK]["ok"]
     assert names["kalmux on PATH"]["ok"]
     assert names["kmux alias"]["ok"] and names["tm alias"]["ok"]
     if os.uname().sysname == "Darwin":
@@ -305,6 +308,7 @@ def test_doctor_checks_reports_missing_pieces(tmp_path):
     names = {c["name"]: c for c in report}
     assert names["hook symlink -> wrapper"]["ok"] is False and names["settings.json hooks use cc-status"]["ok"] is False
     assert names["tmux.conf allow-passthrough"]["ok"] is False
+    assert names[tmsetup.EXIT_EMPTY_CHECK]["ok"] is False
     if os.uname().sysname == "Darwin":
         assert names["ui server reachable"]["ok"] is False and "kalmux ui start" in names["ui server reachable"]["info"]
         assert names["iTerm2 AutoLaunch script starts the ui server"]["ok"] is False and "foreign" in names["iTerm2 AutoLaunch script starts the ui server"]["info"]
@@ -456,7 +460,7 @@ def test_doctor_reports_the_session_snapshot_of_the_running_server(tmp_path, mon
               "tmux_conf": tmp_path / "c", "defaults_reader": lambda key: "", "autolaunch": lambda: "missing",
               "state_dir": tmp_path / "state", "statusline": False, "config_loader": lambda: {"_errors": []},
               "ui_health": lambda: {"pid": 1, "tmux": "/opt/homebrew/bin/tmux", "version": tmsetup.VERSION}}
-    name = "session snapshot (restore after reboot)"
+    name = "session snapshot (restore after a crash or reboot)"
     green = {c["name"]: c for c in tmsetup.doctor_checks(snapshot_status=lambda: (True, "2 session(s), 3s old"), **common)}
     assert green[name]["ok"] is True and "2 session(s)" in green[name]["info"]
     red = {c["name"]: c for c in tmsetup.doctor_checks(snapshot_status=lambda: (False, "sessions.json missing"), **common)}
@@ -478,8 +482,8 @@ def snapshot_tmux(*names):
 
 
 def write_sessions(path, boot, *names):
-    sessions = tuple(tmrestore.SavedSession(name=n, cwd="/tmp", created=1000 + i) for i, n in enumerate(names))
-    tmrestore.write_snapshot(path, tmrestore.Snapshot(boot=boot, saved_at=1, sessions=sessions))
+    sessions = tuple(tmsnapshot.SavedSession(name=n, cwd="/tmp", created=1000 + i) for i, n in enumerate(names))
+    tmsnapshot.write_snapshot(path, tmsnapshot.Snapshot(boot=boot, saved_at=1, sessions=sessions))
     return path
 
 
@@ -514,6 +518,17 @@ def test_check_session_snapshot_still_reports_a_drift_that_does_not_heal(tmp_pat
     slept = []
     ok, info = tmsetup.check_session_snapshot(path, tmux=snapshot_tmux("api", "foo"), sleep=slept.append)
     assert ok is False and "foo" in info and len(slept) == 1
+
+
+def test_check_session_snapshot_reports_a_list_that_belongs_to_a_server_that_is_gone(tmp_path, monkeypatch):
+    """The names can agree and the file can be seconds old and the restore still be outstanding."""
+    monkeypatch.setattr(tmrestore, "boot_time", lambda: 7)
+    path = tmp_path / "sessions.json"
+    tmsnapshot.write_snapshot(path, tmsnapshot.Snapshot(boot=7, saved_at=1, server=tmsnapshot.ServerId(pid=11, started=22),
+                                                      sessions=(tmsnapshot.SavedSession(name="api", cwd="/tmp"),)))
+    slept = []
+    ok, info = tmsetup.check_session_snapshot(path, tmux=snapshot_tmux("api"), sleep=slept.append)
+    assert ok is False and "restore pending" in info and slept == []
 
 
 def test_check_session_snapshot_does_not_wait_for_a_file_that_is_simply_missing(tmp_path, monkeypatch):

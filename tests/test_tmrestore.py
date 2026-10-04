@@ -1,229 +1,33 @@
-"""Tests for src/kalmux/tmrestore.py: the session snapshot and the restore after a reboot.
+"""Tests for src/kalmux/tmrestore.py: the keeper that watches the tmux server, and the restore that
+runs when the server holding the saved sessions turns out to be gone.
 
-Everything runs against the fakes and tmp_path, except the one end-to-end test at the bottom, which drives
-a REAL tmux on a private socket (`-L kalmux-test-<pid>`) and kills only the sessions it created.
+Everything runs against the fakes and tmp_path, except the end-to-end tests at the bottom, which drive a
+REAL tmux on a private socket (`-L kalmux-test-<pid>` / `-L kalmux-crash-<pid>`) and kill only the
+sessions they created — never a server: the empty one is let go with `exit-empty on` (incident
+2026-09-14, when `tmux kill-server` took down every Claude session the user had open).
 """
-import contextlib
-import dataclasses
-import json
-import os
-import subprocess
 import threading
 import time
 
 import pytest
 
 from fakes import FakeIt2, FakeTmux, pane
-from kalmux import tmcore, tmrestore
-from kalmux.tmcore import Tmux, resolve_tmux
-
-BOOT_OUT = "{ sec = 1790848664, usec = 496772 } Tue Sep 30 21:37:44 2026\n"
-
-
-def fake_tmux(*names, colors=None, path="/Volumes/Dev/proj"):
-    """A FakeTmux holding one pane per session name, in that order."""
-    panes = [pane(name, pane_id=f"%{i}", window_id=f"@{i}", path=f"{path}/{name}") for i, name in enumerate(names)]
-    return FakeTmux(panes=panes, colors=dict(colors or {}))
-
-
-def saved(name, cwd="/tmp", color="", created=1000):
-    return tmrestore.SavedSession(name=name, cwd=cwd, color=color, created=created)
-
-
-# ---------- boot time ----------
-def test_boot_time_reads_the_kernel_boot_second():
-    assert tmrestore.boot_time(lambda _cmd: (0, BOOT_OUT)) == 1790848664
-
-
-@pytest.mark.parametrize("answer", [(1, ""), (0, ""), (0, "nonsense"), (127, "sysctl: unknown oid"), (0, "{ sec = x }")])
-def test_boot_time_is_zero_when_the_kernel_does_not_answer(answer):
-    """0 means "unknown": the restore must then do nothing rather than guess that this is a new boot."""
-    assert tmrestore.boot_time(lambda _cmd: answer) == 0
-
-
-def test_boot_time_asks_sysctl_for_kern_boottime():
-    seen = []
-    tmrestore.boot_time(lambda cmd: (seen.append(cmd), (0, BOOT_OUT))[1])
-    assert seen == [list(tmrestore.BOOT_COMMAND)] and "kern.boottime" in tmrestore.BOOT_COMMAND
-
-
-def test_boot_time_on_this_machine_is_either_a_real_second_or_zero():
-    value = tmrestore.boot_time()
-    assert value == 0 or 1_000_000_000 < value < time.time() + 60
-
-
-def test_boot_time_survives_a_sysctl_that_cannot_even_run(monkeypatch):
-    def boom(*_a, **_k):
-        raise OSError("no such binary")
-    monkeypatch.setattr(tmrestore.subprocess, "run", boom)
-    assert tmrestore.boot_time() == 0
-
-
-# ---------- live sessions ----------
-def test_live_sessions_reads_name_cwd_color_and_creation_order():
-    tmux = fake_tmux("api", "web", colors={"api": "#0a84ff"})
-    rows = tmrestore.live_sessions(tmux)
-    assert [s.name for s in rows] == ["api", "web"]
-    assert rows[0].cwd == "/Volumes/Dev/proj/api" and rows[0].color == "#0a84ff" and rows[0].created == 1000
-    assert rows[1].color == "" and rows[1].created == 1001
-
-
-def test_live_sessions_returns_none_when_tmux_does_not_answer():
-    """A stopped server exits 1: that is NOT "the user has no sessions", so nothing may be written."""
-    tmux = fake_tmux("api")
-    tmux.down = True
-    assert tmrestore.live_sessions(tmux) is None
-
-
-def test_live_sessions_drops_forged_names_and_junk_colors():
-    tmux = fake_tmux("api")
-    tmux.panes.append(pane("bad name", pane_id="%9", path="/tmp"))
-    tmux.colors = {"api": "not-a-color"}
-    rows = tmrestore.live_sessions(tmux)
-    assert [s.name for s in rows] == ["api"] and rows[0].color == ""
-
-
-def test_live_sessions_keeps_creation_order_even_when_tmux_lists_them_alphabetically():
-    tmux = fake_tmux("zeta", "alpha")
-    tmux.colors = {}
-    rows = tmrestore.live_sessions(tmux)
-    assert [s.name for s in rows] == ["zeta", "alpha"]       # created 1000 before 1001
-
-
-def test_live_sessions_skips_records_with_the_wrong_number_of_fields(monkeypatch):
-    tmux = fake_tmux("api")
-    monkeypatch.setattr(tmux, "run_rc", lambda *_a: (0, "short\nalpha\x1f/tmp\x1f\x1f7\n"))
-    assert [s.name for s in tmrestore.live_sessions(tmux)] == ["alpha"]
-
-
-def test_live_sessions_keeps_a_session_whose_directory_name_holds_a_newline(monkeypatch):
-    """macOS allows a newline in a directory name and tmux passes #{pane_current_path} through verbatim:
-    splitting the output on "\\n" would break that record in two and drop the session for good."""
-    tmux = fake_tmux("api")
-    out = "api\x1f/tmp/two\nlines\x1f#0a84ff\x1f1000\nweb\x1f/tmp\x1f\x1f1001\n"
-    monkeypatch.setattr(tmux, "run_rc", lambda *_a: (0, out))
-    rows = tmrestore.live_sessions(tmux)
-    assert [s.name for s in rows] == ["api", "web"]
-    assert rows[0].cwd == "/tmp/two\nlines"      # the exact path, or the restore cannot find the directory
-
-
-# ---------- the snapshot file ----------
-def test_saved_session_and_snapshot_are_frozen():
-    with pytest.raises(dataclasses.FrozenInstanceError):
-        saved("api").name = "other"
-    with pytest.raises(dataclasses.FrozenInstanceError):
-        tmrestore.Snapshot(boot=1, saved_at=2).boot = 3
-
-
-def test_write_then_read_a_snapshot_round_trips(tmp_path):
-    path = tmp_path / "state" / "sessions.json"
-    snap = tmrestore.Snapshot(boot=11, saved_at=22, sessions=(saved("api", color="#0a84ff"), saved("web", created=1001)))
-    assert tmrestore.write_snapshot(path, snap) is True
-    back = tmrestore.read_snapshot(path)
-    assert back == snap and back.names == ("api", "web")
-    assert json.loads(path.read_text())["version"] == tmrestore.SNAPSHOT_VERSION
-
-
-def test_the_snapshot_file_is_private(tmp_path):
-    """It lists every project the user works on: 0600 in a 0700 directory, like the rest of the state dir."""
-    path = tmp_path / "state" / "sessions.json"
-    tmrestore.write_snapshot(path, tmrestore.Snapshot(boot=1, saved_at=2, sessions=(saved("api"),)))
-    assert oct(path.stat().st_mode)[-3:] == "600" and oct(path.parent.stat().st_mode)[-3:] == "700"
-    assert not list(path.parent.glob("*.tmp"))               # the temp file is renamed, never left behind
-
-
-def test_write_snapshot_replaces_the_previous_file_atomically(tmp_path):
-    path = tmp_path / "sessions.json"
-    tmrestore.write_snapshot(path, tmrestore.Snapshot(boot=1, saved_at=2, sessions=(saved("api"),)))
-    tmrestore.write_snapshot(path, tmrestore.Snapshot(boot=1, saved_at=3, sessions=()))
-    assert tmrestore.read_snapshot(path).sessions == ()
-
-
-def test_write_snapshot_never_reuses_one_temp_path(tmp_path, monkeypatch):
-    """A fixed `sessions.json.tmp` is one shared, truncated buffer: two writers (two threads, or an old
-    server shutting down while a new one starts) overwrite each other there and rename a mixed file in."""
-    path = tmp_path / "sessions.json"
-    snap = tmrestore.Snapshot(boot=1, saved_at=2, sessions=(saved("api"),))
-    seen, real = [], os.replace
-    monkeypatch.setattr(tmrestore.os, "replace", lambda src, dst: (seen.append(str(src)), real(src, dst))[1])
-    assert tmrestore.write_snapshot(path, snap) and tmrestore.write_snapshot(path, snap)
-    assert len(set(seen)) == 2 and str(path) + ".tmp" not in seen
-    assert all(name.startswith(str(path) + ".") and name.endswith(".tmp") for name in seen)
-
-
-def test_write_snapshot_cleans_up_its_temp_file_when_the_rename_fails(tmp_path, monkeypatch):
-    def refuse(_src, _dst):
-        raise OSError("read-only file system")
-
-    monkeypatch.setattr(tmrestore.os, "replace", refuse)
-    path = tmp_path / "sessions.json"
-    assert tmrestore.write_snapshot(path, tmrestore.Snapshot(boot=1, saved_at=2)) is False
-    assert not path.exists() and list(tmp_path.glob("*.tmp")) == []
-
-
-def test_write_snapshot_reports_a_directory_it_cannot_create(tmp_path):
-    blocker = tmp_path / "blocked"
-    blocker.write_text("not a directory")
-    assert tmrestore.write_snapshot(blocker / "sessions.json", tmrestore.Snapshot(boot=1, saved_at=2)) is False
-
-
-@pytest.mark.parametrize("body", [
-    "", "not json", "[]", '{"version": 2, "boot": 1, "saved_at": 2, "sessions": []}',
-    '{"version": 1, "boot": "x", "saved_at": 2, "sessions": []}',
-    '{"version": 1, "boot": 1, "saved_at": 2, "sessions": {}}',
-])
-def test_read_snapshot_refuses_anything_that_is_not_our_document(tmp_path, body):
-    path = tmp_path / "sessions.json"
-    path.write_text(body)
-    assert tmrestore.read_snapshot(path) is None
-
-
-def test_read_snapshot_of_a_missing_file_is_none(tmp_path):
-    assert tmrestore.read_snapshot(tmp_path / "nope.json") is None
-
-
-def test_read_snapshot_drops_entries_that_are_not_restorable(tmp_path):
-    path = tmp_path / "sessions.json"
-    path.write_text(json.dumps({"version": 1, "boot": 1, "saved_at": 2, "sessions": [
-        {"name": "api", "cwd": "/tmp", "color": "#0a84ff", "created": 7},
-        {"name": "bad name", "cwd": "/tmp", "color": "", "created": 8},
-        {"name": "nocwd", "created": 9},
-        "junk",
-        {"name": "badcolor", "cwd": "/tmp", "color": "red", "created": 10},
-    ]}))
-    snap = tmrestore.read_snapshot(path)
-    assert snap.names == ("api", "nocwd", "badcolor")
-    assert snap.sessions[1].cwd == "" and snap.sessions[2].color == ""
-
-
-def test_copy_snapshot_keeps_the_previous_boots_list(tmp_path):
-    path, previous = tmp_path / "sessions.json", tmp_path / "sessions.previous.json"
-    tmrestore.write_snapshot(path, tmrestore.Snapshot(boot=7, saved_at=8, sessions=(saved("api"),)))
-    assert tmrestore.copy_snapshot(path, previous) is True
-    assert tmrestore.read_snapshot(previous).boot == 7 and oct(previous.stat().st_mode)[-3:] == "600"
-    assert tmrestore.copy_snapshot(tmp_path / "gone.json", previous) is False
+from helpers_restore import Clock, fake_tmux, saved
+from kalmux import tmrestore, tmsnapshot
 
 
 # ---------- the snapshotter ----------
-class Clock:
-    def __init__(self, now=1_000_000.0):
-        self.now = now
-
-    def __call__(self):
-        return self.now
-
-
 def test_snapshotter_writes_only_when_the_session_list_changed(tmp_path):
     tmux = fake_tmux("api")
     clock = Clock()
     shot = tmrestore.Snapshotter(tmp_path / "sessions.json", tmux, boot=42, clock=clock)
     assert shot.tick() is True
-    assert tmrestore.read_snapshot(shot.path).names == ("api",) and tmrestore.read_snapshot(shot.path).boot == 42
+    assert tmsnapshot.read_snapshot(shot.path).names == ("api",) and tmsnapshot.read_snapshot(shot.path).boot == 42
     clock.now += 5
     assert shot.tick() is False                              # same list: no write, no churn on the disk
     tmux.panes.append(pane("web", pane_id="%9", path="/tmp/web"))
-    assert shot.tick() is True and tmrestore.read_snapshot(shot.path).names == ("api", "web")
-    assert tmrestore.read_snapshot(shot.path).saved_at == int(clock.now)
+    assert shot.tick() is True and tmsnapshot.read_snapshot(shot.path).names == ("api", "web")
+    assert tmsnapshot.read_snapshot(shot.path).saved_at == int(clock.now)
 
 
 def test_snapshotter_can_be_forced_to_write_an_unchanged_list(tmp_path):
@@ -232,32 +36,174 @@ def test_snapshotter_can_be_forced_to_write_an_unchanged_list(tmp_path):
     assert shot.tick() is True and shot.tick() is False and shot.tick(force=True) is True
 
 
-def test_snapshotter_waits_out_a_shutdown_before_writing_an_empty_list(tmp_path):
-    """Every process gets SIGTERM at once at shutdown, so the server dies long before the grace period:
-    the last good list survives the reboot. Only a server that stays unreachable really has no sessions."""
+def test_snapshotter_never_writes_while_no_server_answers(tmp_path):
+    """0.5.0 waited 30 s and then wrote []. An iTerm2 crash takes tmux down with the sessions still in it,
+    so a silent server is never "the user has no sessions": nothing is written until one answers again."""
     tmux = fake_tmux("api")
     clock = Clock()
-    shot = tmrestore.Snapshotter(tmp_path / "sessions.json", tmux, boot=1, clock=clock, grace=30.0)
+    shot = tmrestore.Snapshotter(tmp_path / "sessions.json", tmux, boot=1, clock=clock)
     shot.tick()
     tmux.down = True
-    assert shot.tick() is False
-    clock.now += 29
-    assert shot.tick() is False and tmrestore.read_snapshot(shot.path).names == ("api",)
-    clock.now += 2
-    assert shot.tick() is True and tmrestore.read_snapshot(shot.path).names == ()
-    clock.now += 60
-    assert shot.tick() is False                              # the empty list is written once, not every 5 s
+    for _ in range(20):
+        clock.now += 60
+        assert shot.tick() is False and shot.tick(force=True) is False
+    assert tmsnapshot.read_snapshot(shot.path).names == ("api",)
     tmux.down = False
-    assert shot.tick() is True and tmrestore.read_snapshot(shot.path).names == ("api",)
+    assert shot.tick() is False                              # the same list, from the same server
+    assert not any(hasattr(m, "UNREACHABLE_GRACE") for m in (tmrestore, tmsnapshot))   # gone, not merely unused
+
+
+def test_snapshotter_writes_an_empty_list_a_live_server_reports(tmp_path):
+    """`exit-empty off` keeps the server up after the last session is killed: that [] is the truth."""
+    tmux = fake_tmux("api")
+    shot = tmrestore.Snapshotter(tmp_path / "sessions.json", tmux, boot=1, clock=Clock())
+    shot.tick()
+    tmux.kill_session("api")
+    assert shot.tick() is True and tmsnapshot.read_snapshot(shot.path).names == ()
+
+
+def test_snapshotter_records_the_server_the_list_came_from(tmp_path):
+    tmux = fake_tmux("api")
+    shot = tmrestore.Snapshotter(tmp_path / "sessions.json", tmux, boot=1, clock=Clock())
+    assert shot.tick() is True
+    assert tmsnapshot.read_snapshot(shot.path).server == tmsnapshot.ServerId(tmux.pid, tmux.started)
+
+
+def test_snapshotter_writes_again_when_only_the_server_changed(tmp_path):
+    """Same names, another server: the file must stop claiming the dead one or the doctor (and the next
+    `kalmux restore`) would keep reporting a restore that is already done."""
+    tmux = fake_tmux("api")
+    shot = tmrestore.Snapshotter(tmp_path / "sessions.json", tmux, boot=1, clock=Clock())
+    assert shot.tick() is True and shot.tick() is False
+    tmux.new_server(keep=("api",))
+    assert shot.tick() is True
+    assert tmsnapshot.read_snapshot(shot.path).server == tmsnapshot.ServerId(tmux.pid, tmux.started)
+
+
+def test_snapshotter_keeps_the_lost_list_before_writing_one_from_another_server(tmp_path):
+    tmux = fake_tmux("api", "web")
+    previous = tmp_path / "sessions.previous.json"
+    shot = tmrestore.Snapshotter(tmp_path / "sessions.json", tmux, boot=1, clock=Clock(), previous_path=previous)
+    shot.tick()
+    tmux.new_server()                                        # the crash: another server, none of the names
+    assert shot.tick() is True
+    assert tmsnapshot.read_snapshot(previous).names == ("api", "web")
+    assert tmsnapshot.read_snapshot(shot.path).names == ()
+
+
+def test_snapshotter_keeps_no_copy_while_the_same_server_answers(tmp_path):
+    tmux = fake_tmux("api", "web")
+    previous = tmp_path / "sessions.previous.json"
+    shot = tmrestore.Snapshotter(tmp_path / "sessions.json", tmux, boot=1, clock=Clock(), previous_path=previous)
+    shot.tick()
+    tmux.kill_session("web")                                 # really killed: nothing to keep, nothing to bring back
+    assert shot.tick() is True and not previous.exists()
+
+
+def test_snapshotter_keeps_no_copy_for_a_list_without_an_identity_on_the_same_boot(tmp_path):
+    """A version-1 file (0.5.0) has no server in it, so it can never equal the live one — but on the same
+    boot nothing was lost, and the copy `kalmux restore` falls back to must survive the first 0.5.1 round."""
+    tmux = fake_tmux("api")
+    path, previous = tmp_path / "sessions.json", tmp_path / "sessions.previous.json"
+    tmsnapshot.write_snapshot(path, tmsnapshot.Snapshot(boot=200, saved_at=1, sessions=(saved("api"),)))
+    tmsnapshot.write_snapshot(previous, tmsnapshot.Snapshot(boot=100, saved_at=1,
+                                                            sessions=(saved("lost-a"), saved("lost-b"))))
+    shot = tmrestore.Snapshotter(path, tmux, boot=200, clock=Clock(), previous_path=previous)
+    assert shot.tick(force=True) is True                     # what startup() does right after restore_on_start
+    assert tmsnapshot.read_snapshot(previous).names == ("lost-a", "lost-b")
+
+
+def test_snapshotter_keeps_a_copy_of_a_list_without_an_identity_from_an_older_boot(tmp_path):
+    """The same file after a reboot: the boot rule is all a version-1 list has, and it says this one is lost."""
+    tmux = fake_tmux("api")
+    path, previous = tmp_path / "sessions.json", tmp_path / "sessions.previous.json"
+    tmsnapshot.write_snapshot(path, tmsnapshot.Snapshot(boot=100, saved_at=1, sessions=(saved("gone"),)))
+    shot = tmrestore.Snapshotter(path, tmux, boot=200, clock=Clock(), previous_path=previous)
+    assert shot.tick(force=True) is True
+    assert tmsnapshot.read_snapshot(previous).names == ("gone",)
+
+
+def test_snapshotter_hands_a_list_whose_server_is_gone_to_the_callback(tmp_path):
+    """The keeper's in-flight restore: tmux died, the kalmux server lived on, a new tmux appeared."""
+    tmux = fake_tmux("api", "web")
+    lost = []
+    shot = tmrestore.Snapshotter(tmp_path / "sessions.json", tmux, boot=1, clock=Clock(),
+                                 previous_path=tmp_path / "prev.json", on_lost=lost.append)
+    shot.tick()
+    tmux.new_server(keep=("api",))                           # the user started one of them again by hand
+    shot.tick()
+    assert [s.names for s in lost] == [("api", "web")]
+    shot.tick()
+    assert len(lost) == 1                                    # the stored server is the live one now: once only
+
+
+def test_snapshotter_calls_back_only_when_a_name_is_actually_missing(tmp_path):
+    tmux = fake_tmux("api")
+    lost = []
+    shot = tmrestore.Snapshotter(tmp_path / "sessions.json", tmux, boot=1, clock=Clock(), on_lost=lost.append)
+    shot.tick()
+    tmux.new_server(keep=("api",))                           # everything came back under the same names
+    assert shot.tick() is True and lost == []
+
+
+def test_snapshotter_calls_back_for_nothing_an_empty_or_version_1_list_cannot_prove(tmp_path):
+    """No sessions saved, or a 0.5.0 file with no identity: the boot rule at startup owns those cases."""
+    path = tmp_path / "sessions.json"
+    tmsnapshot.write_snapshot(path, tmsnapshot.Snapshot(boot=1, saved_at=2, sessions=(saved("web"),)))
+    lost = []
+    shot = tmrestore.Snapshotter(path, fake_tmux("api"), boot=1, clock=Clock(), on_lost=lost.append)
+    assert shot.tick() is True and lost == []                # no identity saved: never guessed at
+    empty = tmp_path / "empty.json"
+    tmsnapshot.write_snapshot(empty, tmsnapshot.Snapshot(boot=1, saved_at=2, server=tmsnapshot.ServerId(1, 2)))
+    other = tmrestore.Snapshotter(empty, fake_tmux("api"), boot=1, clock=Clock(), on_lost=lost.append)
+    assert other.tick() is True and lost == []
+
+
+def test_snapshotter_reads_the_stored_snapshot_when_it_is_built(tmp_path):
+    """The crash the keeper has to catch happens BEFORE its first round: a Snapshotter that only learns
+    the list it wrote itself would see no change at all on the round after a server restart."""
+    path = tmp_path / "sessions.json"
+    tmsnapshot.write_snapshot(path, tmsnapshot.Snapshot(boot=1, saved_at=2, sessions=(saved("api"), saved("web")),
+                                                      server=tmsnapshot.ServerId(pid=11, started=22)))
+    lost = []
+    shot = tmrestore.Snapshotter(path, fake_tmux("api"), boot=1, clock=Clock(), on_lost=lost.append)
+    assert shot.tick() is True
+    assert [s.names for s in lost] == [("api", "web")]
+
+
+def test_snapshotter_does_not_hold_its_lock_while_the_callback_restores(tmp_path):
+    """Backend.do takes the server lock, then _kept -> run_once takes this one. A callback that restored
+    under this lock would take the two in the other order, and two threads in that order deadlock."""
+    tmux = fake_tmux("api", "web")
+    seen = []
+    shot = tmrestore.Snapshotter(tmp_path / "sessions.json", tmux, boot=1, clock=Clock(),
+                                 on_lost=lambda _s: seen.append(shot._lock.locked()))
+    shot.tick()
+    tmux.new_server()
+    shot.tick()
+    assert seen == [False]
+
+
+def test_snapshotter_writes_the_new_list_before_it_calls_back(tmp_path):
+    """The file is the keeper's "already handled" mark: a callback that ran first (and restored, and
+    ticked again from the HTTP thread) would be handed the same list twice."""
+    tmux = fake_tmux("api", "web")
+    on_disk = []
+    shot = tmrestore.Snapshotter(tmp_path / "sessions.json", tmux, boot=1, clock=Clock(),
+                                 on_lost=lambda _s: on_disk.append(tmsnapshot.read_snapshot(shot.path).server))
+    shot.tick()
+    tmux.new_server()
+    shot.tick()
+    assert on_disk == [tmsnapshot.ServerId(tmux.pid, tmux.started)]
 
 
 def test_snapshotter_final_snapshot_needs_a_live_tmux(tmp_path):
     tmux = fake_tmux("api")
     shot = tmrestore.Snapshotter(tmp_path / "sessions.json", tmux, boot=1, clock=Clock())
-    assert shot.final() is True and tmrestore.read_snapshot(shot.path).names == ("api",)
+    assert shot.final() is True and tmsnapshot.read_snapshot(shot.path).names == ("api",)
     tmux.down = True
     assert shot.final() is False
-    assert tmrestore.read_snapshot(shot.path).names == ("api",)      # the dying server never empties the list
+    assert tmsnapshot.read_snapshot(shot.path).names == ("api",)      # the dying server never empties the list
 
 
 def test_snapshotter_survives_a_state_dir_it_cannot_write(tmp_path):
@@ -289,7 +235,9 @@ class FlipTmux:
         self._long = "".join(f"s{i}\x1f/Volumes/Dev/p{i}\x1f\x1f{1000 + i}\n" for i in range(40))
         self._short = "api\x1f/tmp\x1f\x1f1\n"
 
-    def run_rc(self, *_args):
+    def run_rc(self, *args):
+        if args and args[0] == "display":
+            return 0, "4242\x1f1790000000\n"                 # one server, every round: only the list flips
         self._n += 1
         return 0, self._long if self._n % 2 else self._short
 
@@ -302,14 +250,14 @@ def test_snapshotter_rounds_never_overlap(tmp_path):
     class CountingTmux:
         socket = ""
 
-        def run_rc(self, *_args):
+        def run_rc(self, *args):
             with guard:
                 busy[0] += 1
                 peak[0] = max(peak[0], busy[0])
             time.sleep(0.002)
             with guard:
                 busy[0] -= 1
-            return 0, "api\x1f/tmp\x1f\x1f1\n"
+            return 0, "4242\x1f1790000000\n" if args[0] == "display" else "api\x1f/tmp\x1f\x1f1\n"
 
     shot = tmrestore.Snapshotter(tmp_path / "sessions.json", CountingTmux(), boot=1, clock=Clock())
     rounds = [lambda: shot.tick(force=True), shot.tick, shot.final]
@@ -337,7 +285,7 @@ def test_concurrent_ticks_never_leave_a_torn_snapshot_on_disk(tmp_path):
 
     def read():
         while not stop.is_set():
-            if path.exists() and tmrestore.read_snapshot(path) is None:
+            if path.exists() and tmsnapshot.read_snapshot(path) is None:
                 unreadable.append(1)
 
     reader = threading.Thread(target=read, daemon=True)
@@ -350,7 +298,7 @@ def test_concurrent_ticks_never_leave_a_torn_snapshot_on_disk(tmp_path):
     stop.set()
     reader.join(timeout=5)
     assert dropped == [] and unreadable == []
-    assert tmrestore.read_snapshot(path) is not None
+    assert tmsnapshot.read_snapshot(path) is not None
 
 
 # ---------- restoring ----------
@@ -478,11 +426,40 @@ def test_open_tabs_skips_a_name_no_tab_command_can_carry():
 
 
 # ---------- restore on start ----------
-def snapshot_file(tmp_path, boot, *names, cwd=None):
+def snapshot_file(tmp_path, boot, *names, cwd=None, server=None):
     path = tmp_path / "sessions.json"
     sessions = tuple(saved(n, cwd=cwd or str(tmp_path), created=1000 + i) for i, n in enumerate(names))
-    tmrestore.write_snapshot(path, tmrestore.Snapshot(boot=boot, saved_at=1, sessions=sessions))
+    tmsnapshot.write_snapshot(path, tmsnapshot.Snapshot(boot=boot, saved_at=1, sessions=sessions, server=server))
     return path
+
+
+# ---------- the one rule that decides a restore ----------
+def stored_snap(*names, boot=100, server=None):
+    return tmsnapshot.Snapshot(boot=boot, saved_at=1, sessions=tuple(saved(n) for n in names), server=server)
+
+
+def live(server=(5, 500), *names):
+    return tmsnapshot.LiveState(server=tmsnapshot.ServerId(*server), sessions=tuple(saved(n) for n in names))
+
+
+OLD, NEW = tmsnapshot.ServerId(4, 400), tmsnapshot.ServerId(5, 500)
+
+
+@pytest.mark.parametrize("stored,state,boot,due,why", [
+    (None, live(), 200, False, "no file at all"),
+    (stored_snap(boot=100, server=OLD), live(), 200, False, "the saved list is empty"),
+    (stored_snap("api", server=OLD), None, 200, True, "no tmux server is running"),
+    (stored_snap("api", server=OLD), live(), 200, True, "another server holds the socket"),
+    (stored_snap("api", server=NEW), live(), 200, False, "the saved server IS the live one"),
+    (stored_snap("api", server=NEW), live(), 0, False, "same server, boot unknown and irrelevant"),
+    (stored_snap("api", boot=100), live(), 200, True, "version 1: a new boot is all there is to go on"),
+    (stored_snap("api", boot=200), live(), 200, False, "version 1, same boot: the user killed them"),
+    (stored_snap("api", boot=0), live(), 200, False, "version 1, boot unknown: never guess"),
+    (stored_snap("api", boot=100), live(), 0, False, "version 1, this boot unknown: never guess"),
+    (stored_snap("api", boot=100), None, 0, True, "nothing is running: the boot does not matter"),
+])
+def test_restore_due_is_one_rule_with_no_hidden_cases(stored, state, boot, due, why):
+    assert tmrestore.restore_due(stored, state, boot) is due, why
 
 
 def test_restore_on_start_recreates_the_previous_boots_sessions(tmp_path):
@@ -493,7 +470,7 @@ def test_restore_on_start_recreates_the_previous_boots_sessions(tmp_path):
     report = tmrestore.restore_on_start(tmux, it2, path, previous, boot=200, log=lines.append)
     assert report["ran"] is True and report["created"] == ["web"] and report["tabs"] == 1
     assert tmux.has_session("web")
-    assert tmrestore.read_snapshot(previous).names == ("api", "web")      # kept before anything is touched
+    assert tmsnapshot.read_snapshot(previous).names == ("api", "web")      # kept before anything is touched
 
 
 def test_restore_on_start_does_nothing_within_the_same_boot(tmp_path):
@@ -526,7 +503,35 @@ def test_restore_on_start_disabled_still_keeps_the_previous_list(tmp_path):
     tmux = fake_tmux("api")
     report = tmrestore.restore_on_start(tmux, FakeIt2(), path, previous, boot=200, enabled=False)
     assert report["ran"] is False and not tmux.has_session("web")
-    assert tmrestore.read_snapshot(previous).names == ("web",) and "enabled" in report["reason"]
+    assert tmsnapshot.read_snapshot(previous).names == ("web",) and "enabled" in report["reason"]
+
+
+def test_restore_on_start_brings_back_the_sessions_of_a_server_that_crashed(tmp_path):
+    """The 0.5.0 miss: iTerm2 was force-quit, tmux went down with it, no reboot. Same boot, other server."""
+    tmux = fake_tmux("api")
+    path = snapshot_file(tmp_path, 200, "api", "web", server=tmsnapshot.ServerId(tmux.pid - 1, tmux.started - 60))
+    previous = tmp_path / "sessions.previous.json"
+    report = tmrestore.restore_on_start(tmux, FakeIt2(window="pty-CUR"), path, previous, boot=200)
+    assert report["ran"] is True and report["created"] == ["web"] and report["tabs"] == 1
+    assert tmsnapshot.read_snapshot(previous).names == ("api", "web")
+
+
+def test_restore_on_start_brings_them_back_when_no_server_is_running_at_all(tmp_path):
+    tmux = fake_tmux()
+    path = snapshot_file(tmp_path, 200, "web", server=tmsnapshot.ServerId(99, 1000))
+    tmux.down = True                                         # `tmux new-session` will start the next server
+    report = tmrestore.restore_on_start(tmux, FakeIt2(), path, tmp_path / "prev.json", boot=200)
+    assert report["ran"] is True and report["created"] == ["web"]
+
+
+def test_restore_on_start_leaves_alone_a_list_the_live_server_wrote(tmp_path):
+    """The identity beats the boot time in both directions: `kalmux ui restart` must restore nothing,
+    and nor must a boot number that disagrees with a server that is demonstrably still the right one."""
+    tmux = fake_tmux("api")
+    path = snapshot_file(tmp_path, 100, "api", "web", server=tmsnapshot.ServerId(tmux.pid, tmux.started))
+    previous = tmp_path / "sessions.previous.json"
+    report = tmrestore.restore_on_start(tmux, FakeIt2(), path, previous, boot=200)
+    assert report["ran"] is False and not tmux.has_session("web") and not previous.exists()
 
 
 # ---------- the keeper ----------
@@ -543,14 +548,14 @@ def test_keeper_startup_restores_then_writes_this_boots_list(tmp_path):
     k = keeper(tmp_path, tmux=tmux)
     report = k.startup()
     assert report["created"] == ["web"] and tmux.has_session("web")
-    snap = tmrestore.read_snapshot(k.snapshotter.path)
+    snap = tmsnapshot.read_snapshot(k.snapshotter.path)
     assert snap.boot == 200 and snap.names == ("api", "web")     # a later `ui restart` must not restore again
 
 
 def test_keeper_startup_writes_an_empty_list_when_there_is_nothing_at_all(tmp_path):
     k = keeper(tmp_path, tmux=FakeTmux(panes=[]))
     k.startup()
-    assert tmrestore.read_snapshot(k.snapshotter.path).names == ()
+    assert tmsnapshot.read_snapshot(k.snapshotter.path).names == ()
 
 
 def test_keeper_run_once_and_stop_take_snapshots(tmp_path):
@@ -561,7 +566,7 @@ def test_keeper_run_once_and_stop_take_snapshots(tmp_path):
     assert k.run_once() is True
     tmux.kill_session("web")
     k.stop()
-    assert tmrestore.read_snapshot(k.snapshotter.path).names == ("api",)
+    assert tmsnapshot.read_snapshot(k.snapshotter.path).names == ("api",)
 
 
 def test_keeper_stop_before_start_is_harmless(tmp_path):
@@ -616,146 +621,240 @@ def test_keeper_never_lets_one_bad_round_kill_the_thread(tmp_path, capsys):
     assert "tmux exploded" in capsys.readouterr().out
 
 
+# ---------- the keeper's in-flight restore (tmux died, the ui server lived on) ----------
+def test_keeper_restores_in_flight_when_another_tmux_server_takes_the_socket(tmp_path, capsys):
+    tmux, it2 = fake_tmux("api", "web"), FakeIt2(window="pty-CUR")
+    k = keeper(tmp_path, tmux=tmux, it2=it2)
+    k.startup()                                              # the keeper was already running: this is our list
+    tmux.new_server(keep=("api",))                           # tmux died; one session was started again by hand
+    assert k.run_once() is True
+    k.restorer.join(5)                                       # the restore runs on a thread of its own
+    assert tmux.has_session("web") and [w for _c, w in it2.tabs] == ["pty-CUR"]
+    assert tmsnapshot.read_snapshot(tmp_path / "sessions.previous.json").names == ("api", "web")
+    out = capsys.readouterr().out
+    assert "restore:" in out and "web" in out and "api" in out
+
+
+def test_keeper_restores_in_flight_only_once(tmp_path):
+    tmux = fake_tmux("api", "web")
+    k = keeper(tmp_path, tmux=tmux)
+    k.startup()
+    tmux.new_server()
+    k.run_once()
+    k.restorer.join(5)
+    made = [c for c in tmux.calls if c[0] == "new"]
+    for _ in range(3):
+        k.run_once()
+    assert [c for c in tmux.calls if c[0] == "new"] == made and len(made) == 2
+
+
+def test_keeper_startup_and_the_in_flight_round_never_restore_the_same_list(tmp_path):
+    """startup() restores first and then writes the new server's list, so the round that follows sees a
+    stored server that IS the live one and has nothing left to bring back."""
+    tmux = fake_tmux("api")
+    snapshot_file(tmp_path, 200, "api", "web", server=tmsnapshot.ServerId(tmux.pid - 1, tmux.started - 60))
+    k = keeper(tmp_path, tmux=tmux)
+    k.startup()
+    made = [c for c in tmux.calls if c[0] == "new"]
+    k.run_once()
+    k.run_once()
+    assert made == [("new", "web", str(tmp_path))] and [c for c in tmux.calls if c[0] == "new"] == made
+
+
+def test_keeper_with_the_automatic_restore_off_only_keeps_the_lost_list(tmp_path, capsys):
+    tmux = fake_tmux("api", "web")
+    k = keeper(tmp_path, tmux=tmux, enabled=False)
+    k.startup()
+    tmux.new_server()
+    assert k.run_once() is True
+    assert not tmux.has_session("api") and not tmux.has_session("web")
+    assert tmsnapshot.read_snapshot(tmp_path / "sessions.previous.json").names == ("api", "web")
+    out = capsys.readouterr().out                            # a list lost without a word is the 0.5.0 bug
+    assert "enabled = false" in out and "2 session(s)" in out and str(tmp_path / "sessions.previous.json") in out
+
+
+def test_keeper_survives_an_in_flight_restore_that_explodes(tmp_path, monkeypatch, capsys):
+    """The callback runs inside a snapshot round, which runs inside the keeper thread AND inside an HTTP
+    request: an exception there must never take either of them down."""
+    tmux = fake_tmux("api", "web")
+    k = keeper(tmp_path, tmux=tmux)
+    k.startup()
+
+    def boom(*_a, **_k):
+        raise RuntimeError("tmux exploded")
+    monkeypatch.setattr(tmrestore, "restore", boom)
+    tmux.new_server()
+    assert k.run_once() is True                              # the snapshot itself still happened
+    k.restorer.join(5)
+    assert "tmux exploded" in capsys.readouterr().out
+
+
+def test_an_in_flight_restore_under_the_backend_lock_does_not_hang(tmp_path):
+    """Backend.do holds the server lock around _kept() -> run_once(), and threading.Lock is not reentrant:
+    a restore that asked for that lock again, on that same thread, would wedge the whole ui server."""
+    backend_lock = threading.Lock()
+    tmux = fake_tmux("api", "web")
+    k = keeper(tmp_path, tmux=tmux, lock=backend_lock)
+    k.startup()
+    tmux.new_server()
+    done = threading.Event()
+
+    def http_request():
+        with backend_lock:                                   # exactly what Backend.do holds while it calls in
+            k.run_once()
+        done.set()
+
+    threading.Thread(target=http_request, daemon=True).start()
+    assert done.wait(10), "the in-flight restore waited for a lock the calling thread already holds"
+    k.restorer.join(5)
+    assert tmux.has_session("web")
+
+
+def test_the_in_flight_restore_leaves_the_requests_thread_and_takes_the_server_lock_itself(tmp_path):
+    """A round is ticked from an HTTP handler that holds the server lock, and a restore is seconds of it2
+    calls (6 s each when iTerm2 is wedged, up to 200 sessions): it gets a thread of its own, so the POST
+    returns at once and nothing queues behind the lock, and that thread — holding no caller lock — takes
+    the server's own around the tmux calls, exactly like the startup path does."""
+    backend_lock = threading.Lock()
+    tmux, it2 = fake_tmux("api", "web"), FakeIt2(window="pty-CUR")
+    seen, caller = {}, threading.current_thread().name
+    make, tab = tmux.new_session, it2.new_tab
+
+    def watched_new_session(name, cwd):
+        seen["locked_while_creating"] = backend_lock.locked()
+        return make(name, cwd)
+
+    def watched_new_tab(command, window=""):
+        seen["tab_thread"], seen["locked_while_opening_tabs"] = threading.current_thread().name, backend_lock.locked()
+        return tab(command, window)
+
+    tmux.new_session, it2.new_tab = watched_new_session, watched_new_tab
+    k = keeper(tmp_path, tmux=tmux, it2=it2, lock=backend_lock)
+    k.startup()
+    tmux.new_server(keep=("api",))
+    with backend_lock:                                       # exactly what Backend.do holds while it calls in
+        assert k.run_once() is True                          # ... and the request is done here, tabs or not
+    k.restorer.join(5)
+    assert not k.restorer.is_alive() and tmux.has_session("web")
+    assert seen["tab_thread"] != caller and seen["locked_while_opening_tabs"] is False
+    assert seen["locked_while_creating"] is True             # the tmux calls stay exclusive with Backend.do
+
+
+def test_an_in_flight_restore_handed_over_after_the_shutdown_creates_nothing(tmp_path):
+    """httpd.shutdown() lets the request already in flight finish, so a round — and the restore it hands
+    over — can still be reached after SIGTERM. The thread that picks it up must touch nothing."""
+    tmux, it2 = fake_tmux("api", "web"), FakeIt2(window="pty-CUR")
+    k = keeper(tmp_path, tmux=tmux, it2=it2)
+    k.startup()
+    k.stop()                                                 # SIGTERM: the final snapshot is taken here
+    tmux.new_server()
+    assert k.run_once() is True                              # the last request in flight, still snapshotting
+    k.restorer.join(5)
+    assert not tmux.has_session("api") and not tmux.has_session("web") and it2.tabs == []
+
+
+def test_a_restore_cut_short_by_the_shutdown_leaves_the_saved_list_for_the_next_start(tmp_path):
+    """`kalmux ui restart` lands while the startup restore is half-way through A, B, C. The thread dies
+    with the interpreter, so nothing may record A as this server's whole list: the saved one stays lost
+    and the next start finishes the job."""
+    tmux, it2 = fake_tmux(), FakeIt2(window="pty-CUR")
+    path = snapshot_file(tmp_path, 200, "A", "B", "C", server=OLD)
+    k = keeper(tmp_path, tmux=tmux, it2=it2)
+    make = tmux.new_session
+
+    def new_session_then_sigterm(name, cwd):
+        ok = make(name, cwd)
+        k.stop()                                             # the signal handler, on the main thread
+        return ok
+
+    tmux.new_session = new_session_then_sigterm
+    k._loop()                                                # what the keeper thread runs, start to finish
+    tmux.new_session = make
+    assert [c for c in tmux.calls if c[0] == "new"] == [("new", "A", str(tmp_path))] and it2.tabs == []
+    saved_list = tmsnapshot.read_snapshot(path)
+    assert saved_list.server == OLD and saved_list.names == ("A", "B", "C")
+    assert keeper(tmp_path, tmux=tmux, it2=it2).startup()["created"] == ["B", "C"]
+
+
 # ---------- picking a list for `kalmux restore` ----------
 def test_restore_source_prefers_the_file_the_server_has_not_rewritten_yet(tmp_path):
     path = snapshot_file(tmp_path, 100, "api")
     previous = tmp_path / "sessions.previous.json"
-    tmrestore.write_snapshot(previous, tmrestore.Snapshot(boot=50, saved_at=1, sessions=(saved("ancient"),)))
-    snap, source = tmrestore.restore_source(path, previous, boot=200)
+    tmsnapshot.write_snapshot(previous, tmsnapshot.Snapshot(boot=50, saved_at=1, sessions=(saved("ancient"),)))
+    snap, source = tmrestore.restore_source(path, previous, live(), boot=200)
     assert snap.names == ("api",) and source == path         # the server has not started since the reboot
+
+
+def test_restore_source_takes_sessions_json_when_its_server_is_not_the_live_one(tmp_path):
+    """A crash with no reboot: sessions.json still names the dead server, so it IS the lost list."""
+    path = snapshot_file(tmp_path, 200, "api", server=OLD)
+    previous = tmp_path / "sessions.previous.json"
+    tmsnapshot.write_snapshot(previous, tmsnapshot.Snapshot(boot=200, saved_at=1, sessions=(saved("ancient"),)))
+    snap, source = tmrestore.restore_source(path, previous, live(), boot=200)
+    assert snap.names == ("api",) and source == path
+
+
+def test_restore_source_falls_back_to_the_copy_once_the_live_server_owns_the_file(tmp_path):
+    path = snapshot_file(tmp_path, 200, "api", server=NEW)   # already rewritten by the server that runs now
+    previous = tmp_path / "sessions.previous.json"
+    tmsnapshot.write_snapshot(previous, tmsnapshot.Snapshot(boot=100, saved_at=1, sessions=(saved("web"),)))
+    snap, source = tmrestore.restore_source(path, previous, live(), boot=200)
+    assert snap.names == ("web",) and source == previous
 
 
 def test_restore_source_falls_back_to_the_previous_boots_copy(tmp_path):
     path = snapshot_file(tmp_path, 200, "api")               # already rewritten for this boot
     previous = tmp_path / "sessions.previous.json"
-    tmrestore.write_snapshot(previous, tmrestore.Snapshot(boot=100, saved_at=1, sessions=(saved("web"),)))
-    snap, source = tmrestore.restore_source(path, previous, boot=200)
+    tmsnapshot.write_snapshot(previous, tmsnapshot.Snapshot(boot=100, saved_at=1, sessions=(saved("web"),)))
+    snap, source = tmrestore.restore_source(path, previous, live(), boot=200)
     assert snap.names == ("web",) and source == previous
 
 
 def test_restore_source_finds_nothing_when_there_is_nothing(tmp_path):
-    assert tmrestore.restore_source(tmp_path / "a.json", tmp_path / "b.json", boot=200) == (None, None)
+    assert tmrestore.restore_source(tmp_path / "a.json", tmp_path / "b.json", live(), boot=200) == (None, None)
 
 
 # ---------- doctor ----------
 def test_snapshot_health_is_green_when_the_file_matches_the_live_sessions(tmp_path):
-    path = snapshot_file(tmp_path, 200, "api", "web")
-    ok, info = tmrestore.snapshot_health(path, boot=200, live=("web", "api"), now=10)
+    path = snapshot_file(tmp_path, 200, "api", "web", server=NEW)
+    ok, info = tmrestore.snapshot_health(path, boot=200, live=live((5, 500), "web", "api"), now=10)
     assert ok is True and "2 session(s)" in info
 
 
 def test_snapshot_health_flags_a_missing_stale_or_disagreeing_file(tmp_path):
-    missing = tmrestore.snapshot_health(tmp_path / "none.json", boot=200, live=(), now=10)
+    missing = tmrestore.snapshot_health(tmp_path / "none.json", boot=200, live=live(), now=10)
     assert missing[0] is False and "missing" in missing[1]
     path = snapshot_file(tmp_path, 100, "api")
-    stale = tmrestore.snapshot_health(path, boot=200, live=("api",), now=10)
+    stale = tmrestore.snapshot_health(path, boot=200, live=live((5, 500), "api"), now=10)
     assert stale[0] is False and "boot" in stale[1]
-    drifted = tmrestore.snapshot_health(snapshot_file(tmp_path, 200, "api"), boot=200, live=("api", "web"), now=10)
+    drifted = tmrestore.snapshot_health(snapshot_file(tmp_path, 200, "api"), boot=200,
+                                        live=live((5, 500), "api", "web"), now=10)
     assert drifted[0] is False and "web" in drifted[1]
 
 
-def test_snapshot_health_stays_green_while_tmux_is_not_running(tmp_path):
-    path = snapshot_file(tmp_path, 200, "api")
+def test_snapshot_health_fails_when_the_saved_list_belongs_to_a_server_that_is_gone(tmp_path):
+    """The restore the keeper could not run (or has not run yet) is a red line in `kalmux doctor`, not a
+    file that merely looks fresh: the names agree, and the list is still the dead server's."""
+    path = snapshot_file(tmp_path, 200, "api", server=OLD)
+    ok, info = tmrestore.snapshot_health(path, boot=200, live=live((5, 500), "api"), now=10)
+    assert ok is False and "restore pending" in info and "4" in info
+
+
+def test_snapshot_health_reports_the_pending_restore_while_no_tmux_server_runs(tmp_path):
+    """The one moment `kalmux doctor` is asked where the sessions went: a saved list under a server that
+    is gone, and nothing running. That is a restore waiting to happen, not a healthy file."""
+    path = snapshot_file(tmp_path, 200, "api", server=OLD)
     ok, info = tmrestore.snapshot_health(path, boot=200, live=None, now=61)
-    assert ok is True and "1m" in info                       # age is shown, tmux is simply not asked
+    assert ok is False and "restore pending" in info and "no tmux server is running" in info and "1m" in info
+
+
+def test_snapshot_health_is_green_with_nothing_saved_and_no_tmux_running(tmp_path):
+    """An empty list is nothing to bring back, so a machine with no tmux at all is not a red doctor."""
+    path = snapshot_file(tmp_path, 200, server=OLD)
+    ok, info = tmrestore.snapshot_health(path, boot=200, live=None, now=10)
+    assert ok is True and "0 session(s)" in info
 
 
 def test_snapshot_health_without_a_readable_boot_time_only_checks_the_names(tmp_path):
     path = snapshot_file(tmp_path, 100, "api")
-    assert tmrestore.snapshot_health(path, boot=0, live=("api",), now=10)[0] is True
-
-
-# ---------- end to end, against a real tmux on a private socket ----------
-TMUX_BIN = resolve_tmux()
-SOCKET = f"kalmux-test-{os.getpid()}"
-
-
-@pytest.fixture
-def private_tmux():
-    """A Tmux bound to our own socket. Teardown kills every session we made there, never the server:
-    `kill-server` on a shell that inherited $TMUX would reach the user's real server (incident 2026-09-14).
-    The empty server then stops by itself (`exit-empty on`) and only its socket file is left to tidy up."""
-    tmux = Tmux(socket=SOCKET)
-    yield tmux
-    for line in tmux.run("list-sessions", "-F", "#{session_name}").split("\n"):
-        if line.strip():
-            tmux.kill_session(line.strip())
-    _drop_stale_socket()
-
-
-def _drop_stale_socket():
-    """Remove OUR socket file once no server answers on it, so a hundred runs do not leave a hundred files.
-
-    Only ever the one path this process named (kalmux-test-<pid>), and only once `list-sessions` fails."""
-    path = os.path.join(os.environ.get("TMUX_TMPDIR") or "/tmp", f"tmux-{os.getuid()}", SOCKET)
-    if SOCKET.startswith("kalmux-test-") and os.path.exists(path) and Tmux(socket=SOCKET).run_rc("list-sessions")[0] != 0:
-        with contextlib.suppress(OSError):
-            os.unlink(path)
-
-
-@pytest.mark.skipif(not TMUX_BIN, reason="tmux is not installed")
-def test_end_to_end_snapshot_and_restore_on_a_private_socket(tmp_path, private_tmux):
-    first, second = tmp_path / "one", tmp_path / "two"
-    first.mkdir()
-    second.mkdir()
-    names = (f"e2e-a-{os.getpid()}", f"e2e-b-{os.getpid()}")
-    for name, directory, color in zip(names, (first, second), ("#8a9a5b", "#0a84ff"), strict=True):
-        assert private_tmux.new_session(name, str(directory))
-        assert private_tmux.set_session_option(name, "@tm_color", color)
-    path, previous = tmp_path / "sessions.json", tmp_path / "sessions.previous.json"
-    shot = tmrestore.Snapshotter(path, private_tmux, boot=111, clock=lambda: 1_000.0)
-    assert shot.tick() is True
-    assert set(tmrestore.read_snapshot(path).names) >= set(names)
-
-    for name in names:
-        assert private_tmux.kill_session(name)
-    assert not private_tmux.has_session(names[0])
-
-    it2 = FakeIt2(window="pty-CUR")
-    report = tmrestore.restore_on_start(private_tmux, it2, path, previous, boot=222, log=lambda _m: None)
-    assert report["ran"] is True and set(report["created"]) >= set(names)
-    live = {s.name: s for s in tmrestore.live_sessions(private_tmux)}
-    for name, directory, color in zip(names, (first, second), ("#8a9a5b", "#0a84ff"), strict=True):
-        assert os.path.realpath(live[name].cwd) == os.path.realpath(directory)
-        assert live[name].color == color
-    assert tmrestore.read_snapshot(previous).boot == 111
-    assert [c for c, _w in it2.tabs] == [f"""/bin/zsh -lc 'exec tmux -L {SOCKET} -CC attach -t "={n}"'; exit"""
-                                         for n in names]
-
-
-def test_a_private_socket_hands_the_child_an_environment_without_tmux(monkeypatch):
-    """-L already wins over $TMUX, so only the child's own environment proves the variable was dropped:
-    anything the session spawns downstream reads $TMUX directly, not tmux's socket precedence."""
-    seen = {}
-
-    class Finished:
-        returncode, stdout = 0, b""
-
-    def fake_run(argv, **kw):
-        seen["argv"], seen["env"] = argv, kw.get("env")
-        return Finished()
-
-    monkeypatch.setattr(tmcore.subprocess, "run", fake_run)
-    monkeypatch.setenv("TMUX", "/private/tmp/tmux-501/default,1,0")
-    Tmux(path="/x/tmux", socket="kalmux-test-env").run_rc("list-sessions")
-    assert seen["argv"][:3] == ["/x/tmux", "-L", "kalmux-test-env"]
-    assert "TMUX" not in seen["env"] and seen["env"]["PATH"] == os.environ["PATH"]
-    Tmux(path="/x/tmux").run_rc("list-sessions")
-    assert seen["argv"][:2] == ["/x/tmux", "list-sessions"]
-    assert seen["env"] is None                               # the user's own server: inherit, strip nothing
-
-
-@pytest.mark.skipif(not TMUX_BIN, reason="tmux is not installed")
-def test_a_private_socket_never_reaches_the_server_in_this_terminal(private_tmux, monkeypatch):
-    """-L wins over $TMUX, and the child never even sees the variable: the user's own server is unreachable."""
-    monkeypatch.setenv("TMUX", "/private/tmp/tmux-501/default,1,0")
-    name = f"e2e-env-{os.getpid()}"
-    assert private_tmux.new_session(name, None)
-    # tmux copies the STARTING client's environment into its global one, so a leaked TMUX is visible there
-    assert private_tmux.run_rc("show-environment", "-g", "TMUX")[0] != 0
-    out = subprocess.run([TMUX_BIN, "-L", SOCKET, "list-sessions", "-F", "#{session_name}"],
-                         capture_output=True, check=False, timeout=15).stdout.decode()
-    assert name in out
-    assert private_tmux.socket == SOCKET and Tmux().socket == ""
-    with pytest.raises(ValueError):
-        Tmux(socket="../../etc/passwd")
+    assert tmrestore.snapshot_health(path, boot=0, live=live((5, 500), "api"), now=10)[0] is True

@@ -35,13 +35,23 @@ class FakeTmux:
     path = "/fake/bin/tmux"
     socket = ""
 
-    def __init__(self, panes=None, colors=None, tty=None):
+    def __init__(self, panes=None, colors=None, tty=None, pid=4242, started=1_790_000_000):
         self.panes = [dict(p) for p in (panes or [])]
         self.colors = colors or {}
         self.calls = []
         self.tty = tty
         self.fail: set[str] = set()
         self.down = False          # like a tmux server that is not running: every command exits 1
+        # the identity `tmux display -p '#{pid}<SEP>#{start_time}'` answers with (see new_server below)
+        self.pid, self.started = pid, started
+
+    def new_server(self, keep=()):
+        """The server died and another one took the socket: new pid, later start time, only `keep` alive.
+
+        That is what an iTerm2 crash plus a fresh `tmux new-session` looks like to the keeper."""
+        self.pid, self.started = self.pid + 1, self.started + 60
+        self.panes = [p for p in self.panes if p["session"] in keep]
+        return self
 
     def list_panes(self):
         return [dict(p) for p in self.panes]
@@ -57,10 +67,16 @@ class FakeTmux:
                 "#{session_created}": str(1000 + index)}
 
     def run_rc(self, *args):
-        """Only what the restore code needs: `list-sessions -F <format>`, token by token."""
+        """Only what the restore code needs: `display -p <format>` and `list-sessions -F <format>`.
+
+        A command name in `fail` exits 1 the way tmux does, so a test can take away the server identity
+        and the session list one at a time."""
         self.calls.append(("run", *args))
-        if self.down:
+        if self.down or (args and args[0] in self.fail):
             return 1, ""                      # no server: tmux prints the error on stderr and exits 1
+        if args and args[0] == "display":
+            fmt = args[args.index("-p") + 1] if "-p" in args and len(args) > args.index("-p") + 1 else ""
+            return 0, fmt.replace("#{pid}", str(self.pid)).replace("#{start_time}", str(self.started)) + "\n"
         if not args or args[0] != "list-sessions":
             return 0, ""
         fmt = args[args.index("-F") + 1] if "-F" in args else "#{session_name}"

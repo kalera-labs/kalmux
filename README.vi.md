@@ -44,7 +44,7 @@ Ba mảnh nhỏ làm hết việc: một cái hook wrapper, CLI `kalmux`, và m�
 
 **Mục `Gone` kéo session sống dậy.** Ngày 14/09/2026, một con agent dọn sandbox của nó đã chạy `tmux kill-server`. Phiên nó chạy lại nằm ngay trong tmux, nên `$TMUX` trỏ vô server thiệt: bốn session, toàn bộ tab, và mấy tiếng làm việc bay sạch trong một câu lệnh. Giờ Kalmux ghi một vệt nhỏ cho từng session Claude (id, thư mục, pane tmux, màu nhận diện). Session nào chết thì thẻ của nó rớt xuống mục `Gone` kèm nút **Resume**: dựng lại session tmux đúng thư mục, đúng màu, gõ sẵn `claude --resume <id>` rồi chờ bạn bấm Enter. Repo cũng có file `CLAUDE.md` cấm tiệt agent chạy `tmux kill-server` lần nữa.
 
-**Khởi động lại máy là session trở về.** Reboot một cái là server tmux chết, kéo theo mọi session. Kalmux ghi lại danh sách đang sống mỗi năm giây, nên lần đầu mở iTerm2 sau khi máy khởi động lại, nó dựng lại từng session còn mở lúc đó — y tên, y thư mục, y màu — mỗi con một tab. Vô tab vừa dựng gõ `claude --continue` là nối lại đúng cuộc hội thoại của thư mục đó liền.
+**Reboot hay crash gì session cũng trở về.** Reboot một cái là server tmux chết, kéo theo mọi session; iTerm2 crash hay bị force quit cũng vậy: iTerm2 chạy server Kalmux, server Kalmux chạy tmux, macOS dẹp nguyên cụm đó một lượt. Kalmux ghi danh sách đang sống mỗi năm giây kèm luôn lý lịch của cái server tmux đẻ ra danh sách đó, nên hễ có một server khác trả lời — hoặc chẳng còn server nào — là nó dựng lại từng session còn mở lúc đó: y tên, y thư mục, y màu, mỗi con một tab. Vô tab vừa dựng gõ `claude --continue` là nối lại đúng cuộc hội thoại của thư mục đó liền.
 
 **Màu nhận diện sống dai.** Hai chục tên màu có sẵn hoặc mã hex tùy ý, lưu ngay trong session tmux và phát lại vô tab iTerm2 mỗi lần attach, nên một project giữ nguyên màu qua detach, qua reboot, qua cả lần dựng lại.
 
@@ -83,7 +83,7 @@ Xong thì mở toolbelt: **View > Toolbelt** (⇧⌘B) rồi chọn **Kalmux**. 
 - `~/.config/iterm2/cc-status` → symlink tới hook wrapper. Đây là đường dẫn iTerm2 ghi vô `~/.claude/settings.json`. Cài lại tích hợp Claude Code của iTerm2 có thể làm mất link này; `kalmux doctor` phát hiện ra, `kalmux setup` gắn lại.
 - `~/.local/bin/kalmux` → chính CLI, khi chạy từ bản clone. `kmux` với `tm` vẫn còn làm alias trỏ cùng chỗ, nên tay quen gõ kiểu cũ hoặc script cũ vẫn chạy. Cài bằng gói thì cái tên đó đã có chủ, `setup` để yên không đụng.
 - Tùy chọn iTerm2 `OpenTmuxWindowsIn=2` (window tmux mở thành tab trong cửa sổ đang attach) và `AutoHideTmuxClientSession=true`.
-- Một khối được quản lý trong `~/.tmux.conf`: `allow-passthrough on`, status line hiện `[working]` / `[waiting]` cho từng window, và một hook `client-attached` phát lại trạng thái với màu vô tab mới.
+- Một khối được quản lý trong `~/.tmux.conf`: `allow-passthrough on`, `exit-empty off` (giết session cuối cùng thì server vẫn còn, khỏi bị nhìn nhầm thành một cú crash), status line hiện `[working]` / `[waiting]` cho từng window, và một hook `client-attached` phát lại trạng thái với màu vô tab mới.
 - `~/Library/Application Support/iTerm2/Scripts/AutoLaunch.scpt`, khởi động server UI mỗi lần iTerm2 mở. Script AutoLaunch do bạn tự viết thì không bao giờ bị ghi đè. Script sinh ra có nhúng sẵn đường dẫn tuyệt đối của trình thông dịch và một tiền tố `PATH`, tại iTerm2 khởi động với `PATH` của login shell, chỗ đó không thấy `python3` đời mới lẫn `tmux` của Homebrew, mà server không tìm ra `tmux` thì toolbelt trống trơn sau mỗi lần khởi động máy.
 - `~/.claude/settings.json` → khóa `statusLine` được cho chạy qua `kalmux statusline`; giá trị cũ được lưu nguyên vẹn và nguyên file được chép ra `settings.json.bak-kalmux` (quyền 0600, vì file đó có thể chứa API key) trước khi sửa. Không muốn thì thêm `--no-statusline`.
 - Tool trong toolbelt, đăng ký qua Python API của iTerm2. Cookie API lấy bằng AppleScript nên không hiện hộp thoại xin quyền nào hết.
@@ -105,7 +105,7 @@ kalmux dead [--all] [--json]  mấy session Claude đã mất: bị giết trư�
 kalmux resume <id|tên>        dựng lại session tmux và gõ sẵn `claude --resume <id>`
 kalmux forget <session-id>    bỏ vệt của một session đã chết
 kalmux restore [--dry-run] [--no-tabs]
-                              dựng lại mấy session còn mở trước lần reboot gần nhất
+                              dựng lại mấy session còn mở trước lúc server tmux đi mất
 kalmux attach <session>       đúng cách cho từng chỗ: -CC trong iTerm2, switch-client trong tmux, attach thường qua SSH
 kalmux reapply [session]      gởi lại trạng thái với màu tab cho mấy pane đang attach
 kalmux ui show|status|start|stop|restart|install|uninstall|url|serve
@@ -134,13 +134,17 @@ Session đã chết được xếp thành `killed` (chưa từng có `SessionEnd
 
 **Điểm mù đã biết:** một shell chạy script cùng loại với nó, kiểu script bash dưới shell bash, sẽ báo tên của chính cái shell đó, nên `busy` đọc ra thành dấu nhắc trống. Bắt được ca này phải cắm hook vô shell chớ format của tmux không thấy.
 
-## Dựng lại session sau khi reboot
+## Dựng lại session sau khi reboot hay sau một cú crash
 
-Reboot là server tmux chết, mọi session chết theo. Thoát iTerm2 thì không: nó chỉ detach mấy client control-mode thôi, nên session nào biến mất lúc máy còn chạy là bị giết thiệt, còn session biến mất qua một lần khởi động lại thì không. Kalmux giữ đúng cái khác biệt đó trong một file.
+Reboot là server tmux chết, mọi session chết theo; iTerm2 crash hay bị force quit cũng y vậy: AutoLaunch chạy server Kalmux, server Kalmux chạy tmux, ba đứa nằm chung một coalition tài nguyên của macOS nên đi là đi chung. Bữa 4/10/2026 ở đây dính đúng ca đó — không reboot, không đăng xuất, iTerm2 tắt chừng nửa giây là session cuối cùng đi theo. Thoát iTerm2 bình thường thì không sao: nó chỉ detach mấy client control-mode thôi. Giết một session cũng không sao: đó là bạn tự tay quyết. Vậy nên thứ Kalmux ghi xuống không phải "session mất rồi" mà là danh sách đã lưu thuộc về server tmux nào.
 
-Server UI ghi danh sách session đang sống — tên, thư mục, màu nhận diện, thứ tự tạo — vô `${KALMUX_STATE_DIR}/sessions.json` mỗi năm giây, và ghi liền sau mỗi lần kill, rename, new hay resume. Danh sách có đổi nó mới ghi, mà tmux lỡ im một chút thì nó cũng không ghi danh sách rỗng: lúc máy tắt, mọi tiến trình bị gởi tín hiệu cùng lúc, server đi từ lâu trước khi hết ba chục giây chờ, nên danh sách tốt cuối cùng còn nguyên. Lúc được kêu dừng, server còn chụp thêm một bản cuối.
+Server UI ghi danh sách session đang sống — tên, thư mục, màu nhận diện, thứ tự tạo — vô `${KALMUX_STATE_DIR}/sessions.json` mỗi năm giây, ghi liền sau mỗi lần kill, rename, new hay resume, kèm luôn pid với giờ khởi động của cái server tmux đang giữ mấy session đó. Có gì đổi nó mới ghi, mà hễ không server nào trả lời thì nó không ghi gì hết: server đi mất là server mà bạn đâu có giết session của nó. Lúc được kêu dừng, nếu tmux còn trả lời được thì nó chụp thêm một bản cuối.
 
-Cái kích hoạt là giờ boot của nhân (`kern.boottime`) chớ không phải "server tmux không chạy": nếu không thì `kalmux ui restart` với mở lại iTerm2 cũng y chang một lần reboot. Server đầu tiên của một lần boot mới sẽ chép danh sách đã lưu qua `sessions.previous.json`, dựng lại mọi session chưa có (tên nào đang có chủ thì để yên, không giành, không đổi tên; thư mục nào đi mất thì mở ở `$HOME` và nói rõ ra), mở mỗi session một tab iTerm2 — con đầu phải mở cửa sổ trước, vì sau reboot làm gì có cửa sổ nào — rồi ghi lại trạng thái của lần boot này, để lần restart sau khỏi dựng lại lần nữa. Nó làm gì đều nằm trong `ui.log`, còn `kalmux doctor` cho coi bản ghi cũ bao lâu rồi và còn khớp với mấy session đang sống hay không.
+`kalmux setup` bỏ dòng `set -s exit-empty off` vô khối quản lý trong `~/.tmux.conf`, nên giết session cuối cùng thì server vẫn đứng đó với danh sách rỗng chớ không tắt. Thiếu dòng đó là hai ca y hệt nhau — giết con cuối, với tmux chết — và con bạn vừa giết sẽ bò về ở lần dựng lại kế tiếp. `kalmux doctor` có kiểm dòng này.
+
+Tới cữ dựng lại khi danh sách đã lưu còn session mà cái server viết ra nó không phải server đang trả lời bây giờ: hoặc chẳng có gì chạy (reboot, hoặc tmux chết mà không ai mở lại), hoặc một server khác đang ôm cái socket. Chỗ kiểm là hai: lúc server UI khởi động — lo ca reboot và ca crash kéo luôn Kalmux theo iTerm2 — và ở mỗi vòng năm giây, lo ca tmux chết mà server Kalmux còn sống nhăn. Đằng nào thì danh sách đã lưu cũng được chép qua `sessions.previous.json` trước, rồi dựng lại mọi session chưa có (tên nào đang có chủ thì để yên, không giành, không đổi tên; thư mục nào đi mất thì mở ở `$HOME` và nói rõ ra), mở mỗi session dựng lại một tab iTerm2 — con đầu phải mở cửa sổ trước, vì sau reboot làm gì có cửa sổ nào — rồi ghi lại trạng thái của server đang chạy, để không dựng lại lần thứ hai. Nó làm gì đều nằm trong `ui.log`, còn `kalmux doctor` cho coi bản ghi cũ bao lâu rồi, còn khớp với mấy session đang sống hay không, và có còn thuộc về một server đã đi mất hay không.
+
+Chạy `tmux kill-server` cố ý thì nhìn y chang một cú crash, nên mấy session đó cũng trở về luôn. Muốn dẹp hẳn thì dẹp từng con: trên UI, `kalmux kill`, `tmux kill-session`, hoặc gõ `exit` ở pane cuối.
 
 Chỉ tên, thư mục với màu trở về thôi: không window, không pane, không tiến trình đang chạy, không cuộc hội thoại. Session dựng lại là một cái shell nằm đúng thư mục — đúng thứ `claude --continue` cần.
 
@@ -149,7 +153,7 @@ kalmux restore --dry-run     # coi trước: tạo mới / đã có sẵn / thư
 kalmux restore               # làm bằng tay (thêm `--no-tabs` nếu khỏi mở tab iTerm2)
 ```
 
-`kalmux restore` đọc danh sách của lần boot trước và không bao giờ ghi đè bản ghi, nên chạy bao nhiêu lần cũng được. Muốn giữ phần ghi nhận mà tắt phần tự động thì để `enabled = false` trong `[restore]`.
+`kalmux restore` đọc `sessions.json` chừng nào file đó còn thuộc về một server đã đi mất, còn khi server đang chạy đã lấy file đó rồi thì nó đọc `sessions.previous.json`. Nó không bao giờ ghi đè bản ghi, nên chạy bao nhiêu lần cũng được. Muốn giữ phần ghi nhận (và bản chép) mà tắt riêng phần tự động thì để `enabled = false` trong `[restore]`; danh sách mất kiểu đó vẫn có một dòng trong `ui.log`, nói luôn file nào đang giữ nó.
 
 ## Cấu hình
 
@@ -173,8 +177,9 @@ iterm2 = "auto"
 bell = false
 
 [restore]
-# Sau khi reboot, lần mở iTerm2 đầu tiên sẽ dựng lại mọi session tmux còn mở lúc đó (y tên, y thư mục,
-# y màu), mỗi con một tab. `kalmux restore` làm đúng việc đó bằng tay.
+# Hễ cái server tmux đang giữ session của bạn đi mất — reboot, iTerm2 crash, tmux chết — là Kalmux dựng
+# lại mọi session còn mở lúc đó (y tên, y thư mục, y màu), mỗi con một tab. `kalmux restore` làm đúng
+# việc đó bằng tay.
 # Danh sách session thì lúc nào cũng được ghi; khóa này chỉ bật/tắt phần dựng lại tự động.
 enabled = true
 ```

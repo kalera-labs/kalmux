@@ -19,7 +19,7 @@ from fakes import (
     write_status,
     write_trail,
 )
-from kalmux import tmconfig, tmcore, tmrestore, tmsetup
+from kalmux import tmconfig, tmcore, tmrestore, tmsetup, tmsnapshot
 
 
 # ---------- colors ----------
@@ -955,8 +955,8 @@ def test_the_tap_runs_end_to_end_through_the_cli(tm, tmp_path):
 
 # ---------- restore after a reboot ----------
 def write_sessions(path, boot, *names, cwd="/tmp"):
-    sessions = tuple(tmrestore.SavedSession(name=n, cwd=cwd, created=1000 + i) for i, n in enumerate(names))
-    tmrestore.write_snapshot(path, tmrestore.Snapshot(boot=boot, saved_at=1, sessions=sessions))
+    sessions = tuple(tmsnapshot.SavedSession(name=n, cwd=cwd, created=1000 + i) for i, n in enumerate(names))
+    tmsnapshot.write_snapshot(path, tmsnapshot.Snapshot(boot=boot, saved_at=1, sessions=sessions))
     return path
 
 
@@ -970,7 +970,7 @@ def test_cmd_restore_recreates_the_previous_boots_sessions(tm, tmp_path, monkeyp
     assert "boot 111" in out and str(path) in out
     assert t.has_session("web") and ("new", "web", str(tmp_path)) in t.calls
     assert [w for _c, w in it2.tabs] == ["pty-CUR"]                 # one tab, for the one session created
-    assert tmrestore.read_snapshot(path).boot == 111                # the CLI never rewrites the snapshot
+    assert tmsnapshot.read_snapshot(path).boot == 111                # the CLI never rewrites the snapshot
 
 
 def test_cmd_restore_dry_run_changes_nothing(tm, tmp_path, monkeypatch, capsys):

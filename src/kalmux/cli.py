@@ -190,15 +190,16 @@ def cmd_forget(trace_dir, session_id: str, status_dir=None) -> int:
     return _report(action_forget(Path(trace_dir), session_id, status_dir))
 
 
-# ----------------------------------------------------------------------------- restore after a reboot
+# ----------------------------------------------------------------------------- restore after a crash or reboot
 def cmd_restore(tmux: Tmux, it2: It2, sessions_file: Path, previous_file: Path, dry_run: bool = False,
                 no_tabs: bool = False, env=None, now: int | None = None) -> int:
-    """Bring back by hand what the previous boot had open; the ui server does it on its own at startup.
+    """Bring back by hand what the tmux server that is gone had open; the ui server does it on its own.
 
-    The CLI only ever READS the snapshot: rewriting it here would tell the next server start that this
-    boot's restore has already happened."""
+    The CLI only ever READS the snapshot: rewriting it here would tell the next server start that the
+    restore has already happened."""
     env = os.environ if env is None else env
-    snap, source = tmrestore.restore_source(sessions_file, previous_file, tmrestore.boot_time())
+    snap, source = tmrestore.restore_source(sessions_file, previous_file, tmrestore.live_state(tmux),
+                                            tmrestore.boot_time())
     if snap is None:
         print(f"kalmux restore: no saved session list in {sessions_file} or {previous_file}", file=sys.stderr)
         return 1
@@ -421,8 +422,8 @@ def build_parser() -> argparse.ArgumentParser:
     res.add_argument("session", help="session id, id prefix, or the tmux session it used to run in")
     fg = sub.add_parser("forget", help="drop a dead session's trail so it stops showing up in `kalmux dead`")
     fg.add_argument("session_id")
-    rs = sub.add_parser("restore", help="recreate the tmux sessions that were open before the last reboot "
-                                        "(name, directory and color), one iTerm2 tab each")
+    rs = sub.add_parser("restore", help="recreate the tmux sessions that were open before the tmux server "
+                                        "went away (name, directory and color), one iTerm2 tab each")
     rs.add_argument("--dry-run", action="store_true", help="print what would happen and change nothing")
     rs.add_argument("--no-tabs", action="store_true", help="recreate the sessions without opening any tab")
     ra = sub.add_parser("reapply", help="re-send Claude status + tab color to attached panes (used by the tmux client-attached hook)")

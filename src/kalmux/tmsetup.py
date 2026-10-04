@@ -70,6 +70,7 @@ MANAGED_END = "# <<< kalmux <<<"
 # every marker pair this block was ever written with; the backreference keeps begin and end paired up
 LEGACY_MANAGED_RE = re.compile(r"# >>> (kmux|tmux-manager)[^\n]*\n.*?# <<< \1 <<<\n?", re.DOTALL)
 KEY_HOOK_EVENTS = {"UserPromptSubmit", "Stop", "Notification", "PermissionRequest", "PreToolUse", "SessionEnd"}
+EXIT_EMPTY_CHECK = "tmux.conf exit-empty off (a killed last session stays killed)"
 
 
 # ----------------------------------------------------------------------------- tmux.conf block
@@ -78,6 +79,8 @@ def managed_block(tm_path: Path = DEFAULT_TM_LINK) -> str:
         MANAGED_BEGIN,
         "# Let iTerm2-specific escape sequences (status, notifications, tab color) reach the terminal.",
         "set -g allow-passthrough on",
+        "# Keep the server up with no session left, so Kalmux can tell \"the last session was killed\" from \"tmux died\".",
+        "set -s exit-empty off",
         "# Show Claude Code state (written by cc-status-tmux) in the status line for normal / remote attaches.",
         "set -g status-interval 5",
         "set -g window-status-format ' #I:#W#{?#{@cc_state}, [#{@cc_state}],} '",
@@ -480,14 +483,12 @@ def check_session_snapshot(sessions_file: Path = SESSIONS_FILE, tmux=None, now=N
     # lazy, like the tmserver import above: `kalmux statusline` imports this module on every status-line
     # refresh and must not pay for dataclasses/threading it never uses.
     from .tmcore import Tmux
-    from .tmrestore import DRIFT_NOTE, SNAPSHOT_EVERY, boot_time, live_sessions, snapshot_health
+    from .tmrestore import DRIFT_NOTE, SNAPSHOT_EVERY, boot_time, live_state, snapshot_health
     server = Tmux() if tmux is None else tmux
     clock, boot = now or time.time, boot_time()
 
     def verdict() -> tuple[bool, str]:
-        live = live_sessions(server)
-        names = None if live is None else [s.name for s in live]
-        return snapshot_health(sessions_file, boot, names, int(clock()))
+        return snapshot_health(sessions_file, boot, live_state(server), int(clock()))
 
     ok, info = verdict()
     if ok or DRIFT_NOTE not in info:
@@ -549,6 +550,9 @@ def doctor_checks(settings_path: Path = DEFAULT_SETTINGS, hook_link: Path = DEFA
     except OSError:
         conf = ""
     add("tmux.conf allow-passthrough", "allow-passthrough on" in conf, str(tmux_conf))
+    # without it, killing the last session stops the server, and that is indistinguishable from a crash:
+    # the restore would bring the session the user just killed straight back
+    add(EXIT_EMPTY_CHECK, "exit-empty off" in conf, str(tmux_conf))
     add("tmux.conf client-attached hook (status replay)", "client-attached" in conf, str(tmux_conf))
     if statusline:
         line = statusline_status() if statusline_status else tmstatusline.status(settings_path, state_dir)
@@ -592,5 +596,5 @@ def doctor_checks(settings_path: Path = DEFAULT_SETTINGS, hook_link: Path = DEFA
                 # only while the server answers: it is the process that writes the file every 5 s
                 # state_dir, not the module default: a doctor pointed at another state dir reads that one
                 status = snapshot_status or (lambda: check_session_snapshot(state_dir / "sessions.json"))
-                add("session snapshot (restore after reboot)", *status())
+                add("session snapshot (restore after a crash or reboot)", *status())
     return checks

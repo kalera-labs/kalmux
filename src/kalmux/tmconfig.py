@@ -56,8 +56,9 @@ iterm2 = "auto"
 bell = false
 
 [restore]
-# After a reboot, the first iTerm2 launch recreates every tmux session that was still open (same name,
-# directory and color), each in its own tab. `kalmux restore` does the same by hand.
+# When the tmux server that held your sessions is gone — a reboot, an iTerm2 crash, a tmux that died —
+# Kalmux recreates every session that was open (same name, directory and color), each in its own tab.
+# `kalmux restore` does the same by hand.
 # The session list is recorded either way; this only turns the automatic restore on and off.
 enabled = true
 """
