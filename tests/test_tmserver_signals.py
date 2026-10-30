@@ -118,7 +118,9 @@ def test_keeper_stop_racing_itself_runs_the_final_snapshot_once(tmp_path):
 
 
 SCRIPT = textwrap.dedent("""
-    import os, signal, sys, threading, time
+    import faulthandler, os, signal, sys, threading, time
+    faulthandler.dump_traceback_later(20, exit=True)     # a hang fails with every thread's stack, not a bare timeout
+    print("child up", flush=True)
     sys.path[:0] = [{tests!r}, {src!r}]
     from fakes import FakeIt2, FakeTmux, pane
     from kalmux import tmconfig, tmserver
