@@ -5,6 +5,7 @@ false "a restore is in flight")."""
 import io
 import os
 import signal
+import socket
 import subprocess
 import sys
 import textwrap
@@ -157,3 +158,16 @@ def test_two_real_sigterms_in_a_row_shut_the_server_down_cleanly(tmp_path):
     assert p.returncode == 0, (out, err)
     assert out.count("shutting down") == 1 and out.count("keeper stop") == 1, out
     assert "reentrant" not in err and "Traceback" not in err, err
+
+
+def test_make_server_never_does_a_reverse_dns_lookup(tmp_path, monkeypatch):
+    """http.server.HTTPServer.server_bind calls socket.getfqdn("127.0.0.1"); on a cold resolver (a CI
+    runner, a login before the network is up) that blocks for tens of seconds before the port answers."""
+    def no_dns(*_a, **_k):
+        raise AssertionError("reverse DNS lookup")
+    monkeypatch.setattr(socket, "getfqdn", no_dns)
+    httpd = tmserver.make_server(0, make_backend(tmp_path))
+    try:
+        assert httpd.server_address[0] == "127.0.0.1" and httpd.server_port == httpd.server_address[1]
+    finally:
+        httpd.server_close()

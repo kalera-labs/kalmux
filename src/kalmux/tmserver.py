@@ -13,6 +13,7 @@ import logging
 import os
 import secrets
 import signal
+import socketserver
 import sys
 import threading
 import time
@@ -466,8 +467,18 @@ def health(port: int, timeout: float = 1.0) -> dict | None:
     return data if isinstance(data, dict) and data.get("app") in (APP_NAME, *LEGACY_APP_NAMES) else None
 
 
+class LoopbackServer(ThreadingHTTPServer):
+    """HTTPServer.server_bind looks up socket.getfqdn(host) only to fill server_name, which nothing here
+    reads. On a cold resolver (a login before the network is up, a CI runner) that lookup blocks for tens
+    of seconds before the port answers, so the bind skips it."""
+
+    def server_bind(self) -> None:
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[0], self.server_address[1]
+
+
 def make_server(port: int, backend: Backend) -> ThreadingHTTPServer:
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    httpd = LoopbackServer(("127.0.0.1", port), Handler)
     httpd.daemon_threads = True
     httpd.backend = backend  # type: ignore[attr-defined]
     return httpd
