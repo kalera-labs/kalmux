@@ -76,7 +76,7 @@ def test_snapshot_groups_panes_and_aggregates_state(tmp_path):
     assert a["title"] == "A waiting" and a["project"] == "proj-a" and a["color"] == "#ff9500" and a["attached"] == 1
     assert a["in_iterm2"] is True and a["panes"][0]["guid"] == "G1" and a["panes"][1]["guid"] == ""
     assert b["state"] == "" and b["in_iterm2"] is False and b["attached"] == 0
-    assert snap["counts"] == {"waiting": 1, "working": 0, "idle": 0, "busy": 0, "unknown": 0, "stale": 0, "gone": 0, "total": 2}
+    assert snap["counts"] == {"waiting": 1, "working": 0, "idle": 0, "busy": 0, "unknown": 0, "stale": 0, "overdue": 0, "gone": 0, "total": 2}
     assert ta.next_waiting(snap["sessions"]) == "a"
 
 
@@ -315,6 +315,32 @@ def test_snapshot_context_comes_from_the_most_urgent_claude_pane(tmp_path):
     assert s["state"] == "waiting" and s["ctx_pct"] == 90 and s["claude_session_id"] == SID_B
 
 
+def test_snapshot_passes_status_age_and_counts_overdue_sessions(tmp_path):
+    now = 100_000
+    reg = tmp_path / "reg"
+    reg.mkdir()
+    for i, (key, sid, status, since) in enumerate([("a:@1.%1", SID_A, "busy", now - 8 * 3600),
+                                                   ("b:@2.%2", SID_B, "busy", now - 8 * 3600),
+                                                   ("c:@3.%3", SID_C, "idle", now - 5 * 3600)], start=1):
+        (reg / f"{i}.json").write_text(json.dumps({"pid": os.getpid(), "sessionId": sid, "tmux": key, "status": status,
+                                                   "statusUpdatedAt": since * 1000}))
+    status = tmp_path / "status"
+    write_status(status, SID_A, ts=now - 60, context_pct=10)                    # ticking: busy for hours, still alive
+    write_status(status, SID_B, ts=now - 7000, context_pct=20)                  # silent for two hours: overdue
+    write_status(status, SID_C, ts=now - 5 * 3600, context_pct=71, cost_usd=2615.79)   # idle, alive: numbers stay
+    tmux = FakeTmux(panes=[pane("a", cmd="zsh"), pane("b", pane_id="%2", window_id="@2", cmd="zsh"),
+                           pane("c", pane_id="%3", window_id="@3", cmd="zsh")])
+    snap = ta.snapshot(tmux, reg, None, now=now, status_dir=status)
+    by = {s["name"]: s for s in snap["sessions"]}
+    assert [by[n]["overdue"] for n in "abc"] == [False, True, False] and "stale" not in by["a"]
+    assert [by[n]["status_age"] for n in "abc"] == [60, 7000, 5 * 3600]
+    assert by["c"]["ctx_pct"] == 71 and by["c"]["cost_usd"] == 2615.79
+    assert [p["overdue"] for p in by["b"]["panes"]] == [True] and by["b"]["panes"][0]["status_age"] == 7000
+    assert snap["counts"]["overdue"] == 1 and snap["counts"]["stale"] == 0 and snap["counts"]["working"] == 2
+    plain = ta.snapshot(tmux, reg, None, now=now)
+    assert plain["sessions"][0]["status_age"] is None
+
+
 # ---------- phase 4: resolve / resume / forget ----------
 def test_resolve_session_exact_then_unique_substring():
     rows = [{"session": "api", "project": "api-svc", "title": "✳ Phase 2"},
@@ -456,3 +482,26 @@ def test_action_new_types_the_configured_claude_command():
     tmux = FakeTmux()
     assert ta.action_new(tmux, "p1", start_claude=True, claude_cmd="claude --model opus").ok
     assert ("send", "=p1:", "claude --model opus") in tmux.calls
+
+
+def test_header_quota_prefers_the_live_reading_over_an_idle_sessions_old_one(tmp_path):
+    """An idle session's 6 h old 92 pct must not hide the 10 pct the busy session reports now."""
+    now = 1_800_000_000
+    reg_dir = tmp_path / "reg"
+    reg_dir.mkdir()
+    status_dir = tmp_path / "status"
+    status_dir.mkdir()
+    ids = {"idle": "0a1b2c3d-0000-4000-8000-000000000001", "busy": "0a1b2c3d-0000-4000-8000-000000000002"}
+    for pid, (name, state) in enumerate((("idle", "idle"), ("busy", "busy")), start=os.getpid()):
+        (reg_dir / f"{pid}.json").write_text(json.dumps({"pid": os.getpid(), "sessionId": ids[name], "tmux": f"{name}:@{pid}.%{pid}",
+                                                         "status": state, "statusUpdatedAt": (now - 60) * 1000}))
+    (status_dir / f"{ids['idle']}.json").write_text(json.dumps({
+        "session_id": ids["idle"], "ts": now - 6 * 3600,
+        "rate_limits": {"five_hour": {"used_pct": 92, "resets_at": now - 5 * 3600}}}))
+    (status_dir / f"{ids['busy']}.json").write_text(json.dumps({
+        "session_id": ids["busy"], "ts": now - 30, "rate_limits": {"five_hour": {"used_pct": 10, "resets_at": now + 3600}}}))
+    pid0 = os.getpid()
+    tmux = FakeTmux([pane("idle", pane_id=f"%{pid0}", window_id=f"@{pid0}"),
+                     pane("busy", pane_id=f"%{pid0 + 1}", window_id=f"@{pid0 + 1}")])
+    snap = ta.snapshot(tmux, reg_dir, None, now=now, status_dir=status_dir)
+    assert snap["quota"]["five_hour"]["used_pct"] == 10

@@ -211,7 +211,7 @@ def test_the_odd_corners_never_raise(tmp_path):
     with pytest.raises(ValueError):
         tmstatusline.load_settings(listy)
     assert tmstatusline.status(listy, tmp_path) == {"routed": False, "command": "", "saved_command": "",
-                                                    "saved_present": True, "fresh": 0}
+                                                    "saved_present": True, "fresh": 0, "interpreter": ""}
     # uninstall on a machine that never had a status line and never installed one: nothing to do
     empty = tmp_path / "empty.json"
     empty.write_text("{}")
@@ -223,7 +223,7 @@ def test_status_reports_routing_saved_command_and_fresh_files(tmp_path):
     settings = settings_with(tmp_path, {"type": "command", "command": "bun hud.ts"})
     report = tmstatusline.status(settings, state)
     assert report == {"routed": False, "command": "bun hud.ts", "saved_command": "", "saved_present": False,
-                      "fresh": 0}
+                      "fresh": 0, "interpreter": ""}
     tmstatusline.install(settings, Path("/opt/kalmux"), state)
     now = int(time.time())
     (state / "status").mkdir(parents=True, exist_ok=True)
@@ -331,6 +331,28 @@ def test_write_settings_preserves_the_mode_and_follows_a_symlink(tmp_path):
     fresh = tmp_path / "fresh" / "settings.json"
     tmstatusline.write_settings(fresh, {"a": 1})
     assert fresh.stat().st_mode & 0o777 == 0o600
+
+
+def test_write_settings_never_leaves_a_readable_temp_copy(tmp_path, monkeypatch):
+    """settings.json can hold API keys: its temp copy is private from the first byte, not chmod-ed later."""
+    path = tmp_path / "settings.json"
+    path.write_text("{}")
+    path.chmod(0o600)
+    seen = []
+    real_replace = os.replace
+
+    def spy(src, dst):
+        seen.append(os.stat(src).st_mode & 0o777)
+        return real_replace(src, dst)
+
+    old_umask = os.umask(0o022)
+    try:
+        monkeypatch.setattr(tmstatusline.os, "chmod", lambda *a, **kw: None)     # only the create mode counts
+        monkeypatch.setattr(tmstatusline.os, "replace", spy)
+        tmstatusline.write_settings(path, {"env": {"KEY": "secret"}})
+    finally:
+        os.umask(old_umask)
+    assert seen == [0o600] and json.loads(path.read_text()) == {"env": {"KEY": "secret"}}
 
 
 def test_write_settings_keeps_a_world_readable_mode_as_it_found_it(tmp_path):

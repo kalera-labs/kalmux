@@ -17,22 +17,25 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
-from .tmcore import HEX_RE, SEP, Tmux, valid_session_name
+from .tmcore import HEX_RE, INTENDED_OPTION, RESTORED_OPTION, SEP, Tmux, valid_session_name
 
 SNAPSHOT_VERSION = 2             # 2 adds "server"; 1 (0.5.0, no identity) is still read
 READABLE_VERSIONS = (1, 2)
 BOOT_COMMAND = ("/usr/sbin/sysctl", "-n", "kern.boottime")
 BOOT_RE = re.compile(r"sec\s*=\s*(\d+)")      # "{ sec = 1790848664, usec = 496772 } Tue Sep 30 21:37:44 2026"
-SESSION_FMT = SEP.join(["#{session_name}", "#{pane_current_path}", "#{@tm_color}", "#{session_created}"])
+SESSION_FMT = SEP.join(["#{session_name}", "#{pane_current_path}", "#{" + INTENDED_OPTION + "}", "#{@tm_color}",
+                        "#{session_created}"])
 SERVER_FMT = SEP.join(["#{pid}", "#{start_time}"])
 MAX_CWD = 1024
 MAX_SESSIONS = 200               # a bound on what one file can ask the server to create at startup
 
 # One SESSION_FMT record. The records are newline-separated, but #{pane_current_path} is whatever the
-# directory is called — macOS allows a newline in there — so only the cwd field may span lines, and the
-# other three anchor where a record really starts and ends.
+# directory is called (macOS allows a newline in there), and so is the intended directory a restore left
+# behind: only those two fields may span lines, and the other three anchor where a record really starts
+# and ends. No field can hold SEP, so the two path fields never run into each other.
 _PLAIN = rf"[^{SEP}\n]*"
-SESSION_RECORD_RE = re.compile(rf"({_PLAIN}){SEP}([^{SEP}]*?){SEP}({_PLAIN}){SEP}(\d*)(?:\n|\Z)", re.S)
+_PATH = rf"[^{SEP}]*?"
+SESSION_RECORD_RE = re.compile(rf"({_PLAIN}){SEP}({_PATH}){SEP}({_PATH}){SEP}({_PLAIN}){SEP}(\d*)(?:\n|\Z)", re.S)
 
 
 # ----------------------------------------------------------------------------- boot time
@@ -117,8 +120,73 @@ def _record(name: str, cwd: str, color: str, created) -> SavedSession | None:
                         created=int(created) if str(created).isdigit() else 0)
 
 
+# ----------------------------------------------------------------------------- the restore's marks
+def _homes(home: str = "") -> set[str]:
+    home = home or os.path.expanduser("~")
+    return {home, os.path.realpath(home)}
+
+
+def recorded_cwd(path: str, intended: str, home: str = "") -> str:
+    """The directory a session counts as being in: the one a restore could not put it in (INTENDED_OPTION)
+    for as long as the pane still sits in the $HOME it fell back to, else wherever the pane is.
+
+    Without this the first snapshot after a fallback writes $HOME over the real directory, and the
+    session never finds its way back (a project on a USB volume that was not mounted yet at login)."""
+    return intended if intended and path in _homes(home) else path
+
+
+def restored_at(row: dict) -> int:
+    """The second a restore recreated this pane's session, or 0 (no mark, or not a number)."""
+    value = str(row.get("restored") or "")
+    return int(value) if value.isdigit() else 0
+
+
+def _attached(row: dict) -> bool:
+    return str(row.get("attached") or "0") not in ("", "0")
+
+
+def pending_restored(panes: list[dict]) -> dict[str, int]:
+    """name -> when, for every session a restore recreated that no client has attached yet, in the order
+    tmux lists them. A client that attached is an opened session, whether or not the mark is cleared yet."""
+    out: dict[str, int] = {}
+    for p in panes:
+        at = restored_at(p)
+        if at and not _attached(p):
+            out.setdefault(p["session"], at)
+    return out
+
+
+def opened_restored(panes: list[dict]) -> list[str]:
+    """Marked sessions a client has attached (a tab, `tmux attach`, ssh): marks only left to clear."""
+    return list(dict.fromkeys(p["session"] for p in panes if restored_at(p) and _attached(p)))
+
+
+def displaced(panes: list[dict], home: str = "") -> dict[str, str]:
+    """name -> intended directory, for every session still sitting in the $HOME a restore put it in while
+    that directory is still missing (once it is there, a restore puts the session back in it)."""
+    homes = _homes(home)
+    return {p["session"]: p["intended"] for p in panes
+            if p.get("intended") and p.get("path") in homes and not os.path.isdir(p["intended"])}
+
+
+def moved_on(panes: list[dict], home: str = "") -> list[str]:
+    """Sessions carrying an intended directory whose active pane has left $HOME: the user took the session
+    somewhere, so the directory a restore could not use stops speaking for it."""
+    homes = _homes(home)
+    return list(dict.fromkeys(p["session"] for p in panes if p.get("intended") and p.get("path") not in homes
+                              and p.get("window_active") == "1" and p.get("pane_active") == "1"))
+
+
+def mark_restored(tmux: Tmux, name: str, when: int) -> bool:
+    return tmux.set_session_option(name, RESTORED_OPTION, str(int(when)))
+
+
+def clear_restored(tmux: Tmux, name: str) -> bool:
+    return tmux.set_session_option(name, RESTORED_OPTION, None)
+
+
 # ----------------------------------------------------------------------------- reading tmux
-def live_sessions(tmux: Tmux) -> tuple[SavedSession, ...] | None:
+def live_sessions(tmux: Tmux, home: str = "") -> tuple[SavedSession, ...] | None:
     """The live sessions in creation order, or None when tmux does not answer.
 
     None is not an empty list: with no server running `list-sessions` exits 1, and writing [] for that
@@ -127,7 +195,12 @@ def live_sessions(tmux: Tmux) -> tuple[SavedSession, ...] | None:
     if rc != 0:
         return None
     # tmux does not escape its data, so a record that does not match whole is never guessed at
-    rows = [row for match in SESSION_RECORD_RE.finditer(out) if (row := _record(*match.groups())) is not None]
+    rows = []
+    for match in SESSION_RECORD_RE.finditer(out):
+        name, path, intended, color, created = match.groups()
+        row = _record(name, recorded_cwd(path, intended, home), color, created)
+        if row is not None:
+            rows.append(row)
     rows.sort(key=lambda s: (s.created, s.name))
     return tuple(rows[:MAX_SESSIONS])
 

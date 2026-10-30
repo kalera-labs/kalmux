@@ -20,6 +20,15 @@ def load_tm():
     return cli
 
 
+@pytest.fixture(autouse=True)
+def _no_volume_wait(monkeypatch):
+    """A restore waits for an unmounted /Volumes/<name> before it falls back to $HOME. No test may sit
+    through that wait by accident (the fakes put their sessions under /Volumes/Dev): the tests of the
+    wait itself set the budget they need."""
+    from kalmux import tmrestore
+    monkeypatch.setattr(tmrestore, "VOLUME_WAIT", 0.0)
+
+
 @pytest.fixture(scope="session")
 def tm():
     return load_tm()
@@ -34,7 +43,7 @@ def write_exec(path: pathlib.Path, body: str) -> pathlib.Path:
 @pytest.fixture
 def fake_env(tmp_path, monkeypatch):
     """A PATH with a fake `tmux` that logs its argv and answers display/show queries,
-    a fake tty (plain file) and a fake original cc-status that records stdin."""
+    a fake tty (plain file) and a fake iTerm2 cc-status that records stdin (the hook must never call it)."""
     fakebin = tmp_path / "fakebin"
     fakebin.mkdir()
     log = tmp_path / "tmux.log"

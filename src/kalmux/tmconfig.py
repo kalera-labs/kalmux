@@ -26,6 +26,7 @@ DEFAULTS: dict = {
     },
     "restore": {
         "enabled": True,
+        "open_tabs": False,
     },
 }
 
@@ -56,11 +57,14 @@ iterm2 = "auto"
 bell = false
 
 [restore]
-# When the tmux server that held your sessions is gone — a reboot, an iTerm2 crash, a tmux that died —
-# Kalmux recreates every session that was open (same name, directory and color), each in its own tab.
+# When the tmux server that held your sessions is gone (a reboot, an iTerm2 crash or quit, a tmux that
+# died), Kalmux recreates every session that was open: same name, directory and color.
 # `kalmux restore` does the same by hand.
 # The session list is recorded either way; this only turns the automatic restore on and off.
 enabled = true
+# Also open one iTerm2 tab per recreated session. Off: the sessions come back without a tab, and the
+# toolbelt marks them "restored" with an "Open all" button (`kalmux open --restored` does the same).
+open_tabs = false
 """
 
 RESUME_MODES = ("type", "run")
@@ -132,9 +136,7 @@ def _validate(raw: dict) -> tuple[dict, list[str]]:
     _validate_claude(_table(raw, "claude", errors), cfg, errors)
     _validate_tombstones(_table(raw, "tombstones", errors), cfg, errors)
     _validate_notify(_table(raw, "notify", errors), cfg, errors)
-    enabled = _flag(_table(raw, "restore", errors), "enabled", "restore.enabled", errors)
-    if enabled is not None:
-        cfg["restore"]["enabled"] = enabled
+    _validate_restore(_table(raw, "restore", errors), cfg, errors)
     return cfg, errors
 
 
@@ -172,6 +174,13 @@ def _validate_notify(notify: dict, cfg: dict, errors: list[str]) -> None:
     bell = _flag(notify, "bell", "notify.bell", errors)
     if bell is not None:
         cfg["notify"]["bell"] = bell
+
+
+def _validate_restore(restore: dict, cfg: dict, errors: list[str]) -> None:
+    for key in ("enabled", "open_tabs"):
+        value = _flag(restore, key, f"restore.{key}", errors)
+        if value is not None:
+            cfg["restore"][key] = value
 
 
 def load_config(path: Path | None = None, env: dict | None = None) -> dict:

@@ -2,12 +2,13 @@
 import json
 import os
 import shutil
+import sys
 from pathlib import Path
 
 import pytest
 
 from fakes import FakeTmux, pane
-from kalmux import tmrestore, tmserver, tmsetup, tmsnapshot
+from kalmux import tmhooks, tmrestore, tmserver, tmsetup, tmsnapshot
 
 
 def test_managed_block_has_passthrough_and_replay_hook():
@@ -247,15 +248,27 @@ def test_toolbelt_registered_reads_dynamic_tools():
 
 
 # ---------- doctor / setup ----------
-def test_doctor_checks_full_report(tmp_path):
+def kalmux_wired(tmp_path, mode="kalmux"):
+    """settings.json with iTerm2's entries plus Kalmux's own, the wrapper, and iTerm2's link to its bundle."""
     settings = tmp_path / "settings.json"
     link = tmp_path / "cc-status"
-    wrapper = tmp_path / "cc-status-tmux"
+    wrapper = tmp_path / "pkg" / "kalmux-hook"
+    wrapper.parent.mkdir()
     wrapper.write_text("#!/bin/bash\n")
     wrapper.chmod(0o755)
-    link.symlink_to(wrapper)
-    hooks = {ev: [{"hooks": [{"type": "command", "command": str(link)}]}] for ev in tmsetup.KEY_HOOK_EVENTS}
+    link.symlink_to("/Applications/iTerm.app/Contents/Resources/utilities/cc-status")
+    hooks = {ev: [{"hooks": [{"type": "command", "command": str(link)}]}] for ev in tmhooks.HOOK_EVENTS}
     settings.write_text(json.dumps({"hooks": hooks}))
+    tmhooks.install_hooks(settings, tmhooks.hook_command(wrapper, mode))
+    return settings, link, wrapper
+
+
+HOOKS_OK = "Claude Code hooks call Kalmux"
+REACH = "hooks reach Kalmux"
+
+
+def test_doctor_checks_full_report(tmp_path):
+    settings, link, wrapper = kalmux_wired(tmp_path)
     conf = tmp_path / "tmux.conf"
     conf.write_text(tmsetup.MANAGED_BLOCK)
     reader = lambda key: {"OpenTmuxWindowsIn": "2", "AutoHideTmuxClientSession": "1", "NoSyncDynamicTools": "vn.kal.kalmux.toolbelt"}.get(key, "")
@@ -268,12 +281,14 @@ def test_doctor_checks_full_report(tmp_path):
               "state_dir": tmp_path / "state",
               "statusline_status": lambda: {"routed": True, "command": "kalmux statusline", "saved_command": "bun hud.ts",
                                             "saved_present": True, "fresh": 1},
-              "config_loader": lambda: {"_errors": []},
+              "config_loader": lambda: {"_errors": []}, "registry_loader": lambda: {}, "iterm_version": lambda: None,
               "snapshot_status": lambda: (True, "3 session(s), 2s old")}
     healthy = {"pid": 42, "tmux": "/opt/homebrew/bin/tmux", "version": tmsetup.VERSION}
     report = tmsetup.doctor_checks(ui_health=lambda: healthy, autolaunch=lambda: "ours", **common)
     names = {c["name"]: c for c in report}
-    assert names["hook symlink -> wrapper"]["ok"] and names["key hook events wired"]["ok"] and names["tmux.conf client-attached hook (status replay)"]["ok"]
+    assert names[HOOKS_OK]["ok"] and names[REACH]["ok"] and names["tmux.conf client-attached hook (status replay)"]["ok"]
+    assert names["iTerm2 owns ~/.config/iterm2/cc-status"]["ok"]
+    assert all(set(c) >= {"name", "ok", "info", "remedy"} for c in report)
     assert names[tmsetup.EXIT_EMPTY_CHECK]["ok"]
     assert names["kalmux on PATH"]["ok"]
     assert names["kmux alias"]["ok"] and names["tm alias"]["ok"]
@@ -306,7 +321,9 @@ def test_doctor_checks_reports_missing_pieces(tmp_path):
                                    tmux_conf=tmp_path / "c", defaults_reader=lambda key: "", ui_health=lambda: None,
                                    autolaunch=lambda: "foreign")
     names = {c["name"]: c for c in report}
-    assert names["hook symlink -> wrapper"]["ok"] is False and names["settings.json hooks use cc-status"]["ok"] is False
+    assert names[HOOKS_OK]["ok"] is False and "no Kalmux entry" in names[HOOKS_OK]["info"]
+    assert names[HOOKS_OK]["fix"] == tmsetup.HOOKS_STEP and "doctor --fix" in names[HOOKS_OK]["remedy"]
+    assert all(c["remedy"] for c in report if not c["ok"])           # every red line says what to do
     assert names["tmux.conf allow-passthrough"]["ok"] is False
     assert names[tmsetup.EXIT_EMPTY_CHECK]["ok"] is False
     if os.uname().sysname == "Darwin":
@@ -325,7 +342,7 @@ def test_run_setup_dry_run_and_failure_count(monkeypatch, capsys):
 
 def test_setup_steps_include_ui_only_on_request(monkeypatch):
     names = [n for n, _ in tmsetup.setup_steps(ui=False)]
-    assert names == [tmsetup.STATE_DIR_STEP, "config file", "hook symlink", "kalmux symlink",
+    assert names == [tmsetup.STATE_DIR_STEP, "config file", tmsetup.HOOKS_STEP, "kalmux symlink",
                      "kmux alias symlink (skipped if the path is not ours)",
                      "tm alias symlink (skipped if the path is not ours)",
                      "iTerm2 prefs", "tmux.conf block", tmsetup.STATUSLINE_STEP]
@@ -407,6 +424,24 @@ def test_doctor_flags_a_routed_status_line_whose_saved_original_is_gone(tmp_path
         "fresh": 0}, **common)}
     check = lost["statusLine routed through kalmux"]
     assert check["ok"] is False and "statusline.json" in check["info"]
+
+
+def test_doctor_checks_the_interpreter_baked_into_the_status_line(tmp_path):
+    common = {"settings_path": tmp_path / "settings.json", "hook_link": tmp_path / "l", "wrapper": tmp_path / "w",
+              "tmux_conf": tmp_path / "c", "defaults_reader": lambda key: "", "ui_health": lambda: None,
+              "autolaunch": lambda: "missing", "ui": False, "state_dir": tmp_path / "state"}
+    name = "statusLine interpreter exists"
+    base = {"routed": True, "saved_command": "bun hud.ts", "saved_present": True, "fresh": 1}
+
+    def check(interpreter, routed=True):
+        status = {**base, "routed": routed, "command": f"{interpreter} /opt/kalmux statusline", "interpreter": interpreter}
+        return {c["name"]: c for c in tmsetup.doctor_checks(statusline_status=lambda: status, **common)}.get(name)
+
+    present = check(sys.executable)
+    assert present["ok"] is True and sys.executable in present["info"]
+    gone = check(str(tmp_path / "python3.13-uninstalled"))
+    assert gone["ok"] is False and "kalmux setup" in gone["info"] and "python3.13-uninstalled" in gone["info"]
+    assert check("") is None and check(sys.executable, routed=False) is None     # bare form / not routed: nothing to check
 
 
 def test_doctor_skips_both_status_line_checks_when_asked(tmp_path):
@@ -541,6 +576,19 @@ def test_check_session_snapshot_does_not_wait_for_a_file_that_is_simply_missing(
 def test_the_session_files_live_in_the_state_dir():
     assert tmsetup.SESSIONS_FILE == tmsetup.STATE_DIR / "sessions.json"
     assert tmsetup.PREVIOUS_SESSIONS_FILE == tmsetup.STATE_DIR / "sessions.previous.json"
+
+
+def test_the_statusline_step_bakes_an_absolute_interpreter_for_a_python_link(tmp_path, monkeypatch):
+    """setup run from a clone: the routed command must not depend on the PATH Claude Code runs it under."""
+    monkeypatch.setattr(tmsetup, "STATE_DIR", tmp_path / "state")
+    link = tmp_path / "kalmux"
+    link.write_text("#!/usr/bin/env python3\n")
+    link.chmod(0o755)
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"statusLine": {"type": "command", "command": f"{link} statusline"}}))
+    tmsetup._install_statusline(settings, link)
+    assert json.loads(settings.read_text())["statusLine"]["command"] == f"{sys.executable} {link} statusline"
+    assert not (tmp_path / "state" / "statusline.json").exists()     # the old wrapper was never saved as the original
 
 
 def test_the_statusline_step_refuses_a_tm_link_that_is_not_executable(tmp_path, monkeypatch):
@@ -699,3 +747,158 @@ def test_cli_path_prefers_the_name_it_was_invoked_as(tmp_path, monkeypatch):
     # invoked as anything else (pytest, python -c), it falls back to the checkout
     monkeypatch.setattr(tmsetup.sys, "argv", ["/usr/bin/pytest"])
     assert tmsetup.cli_path() == tmsetup.SOURCE_CHECKOUT / "bin" / "kalmux"
+
+
+# ---------- Claude Code hooks: the doctor's view, --fix and the setup step ----------
+def test_setup_wires_claude_hooks_instead_of_hijacking_the_cc_status_link():
+    names = [name for name, _ in tmsetup.setup_steps(ui=False, statusline=False)]
+    assert tmsetup.HOOKS_STEP in names and "hook symlink" not in names
+    assert names.index(tmsetup.HOOKS_STEP) < names.index("tmux.conf block")
+
+
+def test_the_hooks_step_calls_wire_claude_hooks_with_the_stable_wrapper(tmp_path, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(tmsetup.tmhooks, "wire_claude_hooks", lambda *a, **kw: seen.update(args=a, kw=kw) or "done")
+    step = dict(tmsetup.setup_steps(ui=False, statusline=False, settings_path=tmp_path / "s.json",
+                                    hook_link=tmp_path / "cc-status"))[tmsetup.HOOKS_STEP]
+    assert step() == "done"
+    assert seen["args"][:2] == (tmp_path / "s.json", tmsetup.WRAPPER) and seen["kw"]["hook_link"] == tmp_path / "cc-status"
+    assert "Cellar" not in str(tmsetup.WRAPPER) and tmsetup.WRAPPER.name == "kalmux-hook"
+
+
+def test_doctor_flags_the_entries_in_the_wrong_mode(tmp_path):
+    settings, link, wrapper = kalmux_wired(tmp_path, mode="kalmux")
+    common = {"settings_path": settings, "hook_link": link, "wrapper": wrapper, "tmux_conf": tmp_path / "c",
+              "defaults_reader": lambda key: "", "ui": False, "statusline": False, "state_dir": tmp_path / "state",
+              "config_loader": lambda: {"_errors": []}, "registry_loader": lambda: {}}
+    native = {c["name"]: c for c in tmsetup.doctor_checks(iterm_version=lambda: (3, 7, 6), **common)}
+    assert native[HOOKS_OK]["ok"] is False and "iterm2" in native[HOOKS_OK]["info"]
+    old = {c["name"]: c for c in tmsetup.doctor_checks(iterm_version=lambda: (3, 7, 4), **common)}
+    assert old[HOOKS_OK]["ok"] is True
+
+
+ITERM_NATIVE = "iTerm2 3.7.5+ (reports tmux panes itself)"
+
+
+def test_doctor_flags_an_iterm2_whose_own_hooks_misreport_tmux_panes(tmp_path):
+    """Before 3.7.5 iTerm2's cc-status, now running next to Kalmux's entry, reports every tmux pane to one
+    hidden tab: nothing Kalmux writes can undo that, so the doctor asks for the upgrade."""
+    settings, link, wrapper = kalmux_wired(tmp_path, mode="kalmux")
+    common = {"settings_path": settings, "hook_link": link, "wrapper": wrapper, "tmux_conf": tmp_path / "c",
+              "defaults_reader": lambda key: "", "ui": False, "statusline": False, "state_dir": tmp_path / "state",
+              "config_loader": lambda: {"_errors": []}, "registry_loader": lambda: {}}
+    old = {c["name"]: c for c in tmsetup.doctor_checks(iterm_version=lambda: (3, 7, 3), **common)}
+    assert old[ITERM_NATIVE]["ok"] is False and "3.7.3" in old[ITERM_NATIVE]["info"]
+    assert "upgrade iTerm2" in old[ITERM_NATIVE]["remedy"] and not old[ITERM_NATIVE]["fix"]
+    tmhooks.install_hooks(settings, tmhooks.hook_command(wrapper, "iterm2"))
+    new = {c["name"]: c for c in tmsetup.doctor_checks(iterm_version=lambda: (3, 7, 6), **common)}
+    assert new[ITERM_NATIVE]["ok"] is True
+    unknown = {c["name"]: c for c in tmsetup.doctor_checks(iterm_version=lambda: None, **common)}
+    assert ITERM_NATIVE not in unknown
+    settings.write_text(json.dumps({"hooks": {}}))                      # no iTerm2 hooks: nothing runs in parallel
+    bare = {c["name"]: c for c in tmsetup.doctor_checks(iterm_version=lambda: (3, 7, 3), **common)}
+    assert ITERM_NATIVE not in bare
+    settings.write_text(json.dumps({"hooks": []}))                      # unreadable hooks: the hooks line says so
+    broken = {c["name"]: c for c in tmsetup.doctor_checks(iterm_version=lambda: (3, 7, 3), **common)}
+    assert ITERM_NATIVE not in broken and broken[HOOKS_OK]["ok"] is False
+
+
+def test_doctor_fix_never_routes_a_status_line_that_is_not_routed(tmp_path):
+    """`setup --no-statusline` is not recorded anywhere, so --fix may only re-bake a command that is ours."""
+    common = {"settings_path": tmp_path / "settings.json", "hook_link": tmp_path / "l", "wrapper": tmp_path / "w",
+              "tmux_conf": tmp_path / "c", "defaults_reader": lambda key: "", "ui_health": lambda: None,
+              "autolaunch": lambda: "missing", "ui": False, "state_dir": tmp_path / "state"}
+    report = tmsetup.doctor_checks(statusline_status=lambda: {
+        "routed": False, "command": "bun /x/hud.ts", "saved_command": "", "saved_present": False, "fresh": 0}, **common)
+    check = {c["name"]: c for c in report}["statusLine routed through kalmux"]
+    assert check["ok"] is False and not check.get("fix") and "kalmux statusline install" in check["remedy"]
+    assert tmsetup.STATUSLINE_STEP not in tmsetup.fix_plan(report)
+
+
+def test_doctor_flags_a_cc_status_link_kalmux_still_holds(tmp_path):
+    settings, link, wrapper = kalmux_wired(tmp_path)
+    link.unlink()
+    link.symlink_to(tmp_path / "old" / "cc-status-tmux")
+    report = {c["name"]: c for c in tmsetup.doctor_checks(
+        settings_path=settings, hook_link=link, wrapper=wrapper, tmux_conf=tmp_path / "c", defaults_reader=lambda key: "",
+        ui=False, statusline=False, state_dir=tmp_path / "state", config_loader=lambda: {"_errors": []},
+        registry_loader=lambda: {}, iterm_version=lambda: None)}
+    check = report["iTerm2 owns ~/.config/iterm2/cc-status"]
+    assert check["ok"] is False and check["fix"] == tmsetup.HOOKS_STEP
+
+
+def test_doctor_reports_when_hooks_stop_reaching_kalmux(tmp_path):
+    import time as _time
+    settings, link, wrapper = kalmux_wired(tmp_path)
+    state = tmp_path / "state"
+    state.mkdir()
+    hb = state / tmhooks.HEARTBEAT_NAME
+    hb.write_text("")
+    now = int(_time.time())
+    os.utime(hb, (now - 3600, now - 3600))
+    common = {"settings_path": settings, "hook_link": link, "wrapper": wrapper, "tmux_conf": tmp_path / "c",
+              "defaults_reader": lambda key: "", "ui": False, "statusline": False, "state_dir": state,
+              "config_loader": lambda: {"_errors": []}, "iterm_version": lambda: None}
+    alive = {"reels:@1.%1": {"alive": True, "statusUpdatedAt": (now - 10) * 1000,
+                             "sessionId": "0a1b2c3d-0000-4000-8000-00000000abcd"}}
+    red = {c["name"]: c for c in tmsetup.doctor_checks(registry_loader=lambda: alive, **common)}
+    assert red[REACH]["ok"] is False and "last event 1h00m ago" in red[REACH]["info"]
+    assert "not reporting: reels" in red[REACH]["info"]
+    assert "restart" in red[REACH]["remedy"] and "still" in red[REACH]["remedy"] and not red[REACH]["fix"]
+    tmhooks.uninstall_hooks(settings)
+    unwired = {c["name"]: c for c in tmsetup.doctor_checks(registry_loader=lambda: alive, **common)}
+    assert unwired[REACH]["fix"] == tmsetup.HOOKS_STEP and "missing" in unwired[REACH]["remedy"]
+    tmhooks.install_hooks(settings, tmhooks.hook_command(wrapper, "kalmux"))       # no state_dir: no wired stamp
+    green = {c["name"]: c for c in tmsetup.doctor_checks(registry_loader=lambda: {}, **common)}
+    assert green[REACH]["ok"] is True and "last event" in green[REACH]["info"]
+    hb.unlink()
+    never = {c["name"]: c for c in tmsetup.doctor_checks(registry_loader=lambda: {}, **common)}
+    assert never[REACH]["ok"] is True and "no hook event yet" in never[REACH]["info"]
+
+
+def test_fix_plan_lists_only_safe_idempotent_steps_in_setup_order():
+    checks = [{"name": "a", "ok": False, "info": "", "remedy": "x", "fix": "tmux.conf block"},
+              {"name": "b", "ok": False, "info": "", "remedy": "y", "fix": tmsetup.HOOKS_STEP},
+              {"name": "c", "ok": False, "info": "", "remedy": "y", "fix": tmsetup.HOOKS_STEP},
+              {"name": "d", "ok": True, "info": "", "remedy": "z", "fix": "kalmux symlink"},
+              {"name": "e", "ok": False, "info": "", "remedy": "kalmux ui install"}]
+    assert tmsetup.fix_plan(checks) == [tmsetup.HOOKS_STEP, "tmux.conf block"]
+    assert "iTerm2 prefs" not in tmsetup.SAFE_FIX_STEPS and tmsetup.STATUSLINE_STEP in tmsetup.SAFE_FIX_STEPS
+
+
+def test_run_fix_runs_the_plan_and_lists_what_needs_a_human(monkeypatch):
+    ran, out = [], []
+    monkeypatch.setattr(tmsetup, "setup_steps", lambda **kw: [
+        (tmsetup.HOOKS_STEP, lambda: ran.append("hooks") or "wired"), ("tmux.conf block", lambda: ran.append("conf")),
+        ("iTerm2 prefs", lambda: ran.append("PREFS"))])
+    checks = [{"name": "hooks", "ok": False, "info": "", "remedy": "kalmux doctor --fix", "fix": tmsetup.HOOKS_STEP},
+              {"name": "prefs", "ok": False, "info": "", "remedy": "kalmux setup (writes iTerm2 preferences)"}]
+    assert tmsetup.run_fix(checks, printer=out.append) == 0
+    assert ran == ["hooks"]
+    text = "\n".join(out)
+    assert "will run: " + tmsetup.HOOKS_STEP in text and "✓ " + tmsetup.HOOKS_STEP + " (wired)" in text
+    assert "prefs" in text and "kalmux setup (writes iTerm2 preferences)" in text
+
+
+def test_run_fix_with_nothing_to_do(monkeypatch):
+    out = []
+    monkeypatch.setattr(tmsetup, "setup_steps", lambda **kw: [])
+    assert tmsetup.run_fix([{"name": "x", "ok": True, "info": "", "remedy": ""}], printer=out.append) == 0
+    assert "nothing" in out[0]
+
+
+def test_run_fix_counts_a_failing_step(monkeypatch):
+    monkeypatch.setattr(tmsetup, "setup_steps", lambda **kw: [(tmsetup.HOOKS_STEP, lambda: (_ for _ in ()).throw(OSError("no")))])
+    out = []
+    checks = [{"name": "h", "ok": False, "info": "", "remedy": "r", "fix": tmsetup.HOOKS_STEP}]
+    assert tmsetup.run_fix(checks, printer=out.append) == 1 and any("✗" in line and "no" in line for line in out)
+
+
+def test_doctor_reports_an_unreadable_settings_file_on_the_hooks_line(tmp_path):
+    settings = tmp_path / "settings.json"
+    settings.write_text("{not json")
+    report = {c["name"]: c for c in tmsetup.doctor_checks(
+        settings_path=settings, hook_link=tmp_path / "l", wrapper=tmp_path / "w", tmux_conf=tmp_path / "c",
+        defaults_reader=lambda key: "", ui=False, statusline=False, state_dir=tmp_path / "state",
+        config_loader=lambda: {"_errors": []}, registry_loader=lambda: {}, iterm_version=lambda: None)}
+    assert report[HOOKS_OK]["ok"] is False and "cannot read" in report[HOOKS_OK]["info"]

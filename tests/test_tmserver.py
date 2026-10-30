@@ -8,7 +8,7 @@ import time
 import pytest
 
 from fakes import FakeIt2, FakeTmux, it2_row, pane, write_trail
-from kalmux import tmconfig, tmserver
+from kalmux import tmconfig, tmhooks, tmserver
 
 TEMPLATE = ('<!doctype html><html><head><meta name="tm-token" content="__TM_TOKEN__">'
             '<meta name="tm-palette" content="__TM_PALETTE__"><style nonce="__TM_NONCE__">body{}</style></head>'
@@ -30,7 +30,9 @@ def backend(tmp_path):
     # every directory is under tmp_path: the server must never read (or prune) the real ~/.local/state/kalmux
     return tmserver.Backend(tmux, it2, registry_dir=tmp_path / "no-registry", ui_path=ui, reapply_delay=0,
                             status_dir=tmp_path / "status", trace_dir=tmp_path / "trace",
-                            config=tmconfig.load_config(path=tmp_path / "none.toml"))
+                            config=tmconfig.load_config(path=tmp_path / "none.toml"),
+                            hooks=tmhooks.HookHealth(tmp_path / "settings.json", tmp_path / "kalmux-hook", tmp_path / "state"),
+                            repair_hooks=lambda: "stub")
 
 
 @pytest.fixture
@@ -418,3 +420,97 @@ def test_serve_reports_foreign_port_owner(backend, monkeypatch, capsys):
     monkeypatch.setattr(tmserver, "health", lambda *_a, **_k: None)
     assert tmserver.serve(1, backend) == 1
     assert "cannot bind" in capsys.readouterr().out
+
+
+# ---------- hook health: data.hook, the Repair action, no trail pruning while hooks are lost ----------
+def wired_backend(backend, tmp_path, wire=True):
+    """Point the backend's hook health and repair at tmp: a wrapper that runs, settings.json, a state dir."""
+    wrapper = tmp_path / "pkg" / "kalmux-hook"
+    wrapper.parent.mkdir(exist_ok=True)
+    wrapper.write_text("#!/bin/bash\nexit 0\n")
+    wrapper.chmod(0o755)
+    settings, state = tmp_path / "settings.json", tmp_path / "state"
+    settings.write_text("{}")
+    if wire:
+        tmhooks.install_hooks(settings, tmhooks.hook_command(wrapper, tmhooks.STATUS_KALMUX), state_dir=state)
+    backend.hooks = tmhooks.HookHealth(settings, wrapper, state)
+    backend.repair_hooks = lambda: tmhooks.wire_claude_hooks(settings, wrapper, state, hook_link=tmp_path / "cc-status",
+                                                            bundle=tmp_path / "no-bundle", info_plist=tmp_path / "none")
+    return settings
+
+
+def test_state_reports_hook_health(server, tmp_path):
+    port, backend = server
+    wired_backend(backend, tmp_path)
+    data = call(port, "GET", "/api/state", token=backend.token)[2]["data"]
+    assert data["hook"] == {"ok": True, "last_seen": None, "reason": ""}
+
+
+def test_state_reports_hooks_that_are_not_wired(server, tmp_path):
+    port, backend = server
+    wired_backend(backend, tmp_path, wire=False)
+    hook = call(port, "GET", "/api/state", token=backend.token)[2]["data"]["hook"]
+    assert hook["ok"] is False and "settings.json" in hook["reason"]
+
+
+def test_repair_hooks_wires_them_and_needs_the_token(server, tmp_path):
+    port, backend = server
+    settings = wired_backend(backend, tmp_path, wire=False)
+    assert call(port, "POST", "/api/repair-hooks", {})[0] == 403
+    status, _, body = call(port, "POST", "/api/repair-hooks", {}, token=backend.token)
+    assert status == 200 and body["ok"] is True and "event entries" in body["message"]
+    assert "kalmux-hook" in settings.read_text()
+    assert call(port, "GET", "/api/state", token=backend.token)[2]["data"]["hook"]["ok"] is True
+
+
+def test_repair_that_cannot_help_says_so_instead_of_reading_as_success(server, tmp_path):
+    """Entries in place, but a session started before the wiring never reports: Repair has nothing to
+    write, and its answer must say the problem is still there (and why)."""
+    import json as _json
+    import os as _os
+    port, backend = server
+    wired_backend(backend, tmp_path)
+    os_utime = tmp_path / "state" / tmhooks.WIRED_NAME
+    _os.utime(os_utime, (1000, 1000))
+    reg = tmp_path / "registry"
+    reg.mkdir()
+    now = int(time.time())
+    (reg / "1.json").write_text(_json.dumps({"pid": _os.getpid(), "sessionId": "0a1b2c3d-0000-4000-8000-00000000abcd",
+                                             "tmux": "reels:@1.%1", "status": "busy", "startedAt": 1000 * 1000,
+                                             "statusUpdatedAt": now * 1000}))
+    backend.registry_dir = reg
+    status, _, body = call(port, "POST", "/api/repair-hooks", {}, token=backend.token)
+    assert status == 200 and "already had" in body["message"]
+    assert "still not reaching Kalmux" in body["message"] and "reels" in body["message"]
+    assert body["data"]["hook"]["ok"] is False
+
+
+def test_repair_hooks_failure_is_a_clean_400(server, tmp_path):
+    port, backend = server
+    wired_backend(backend, tmp_path, wire=False)
+    backend.repair_hooks = lambda: (_ for _ in ()).throw(OSError("settings.json is read-only"))
+    status, _, body = call(port, "POST", "/api/repair-hooks", {}, token=backend.token)
+    assert status == 400 and body["ok"] is False and "read-only" in body["message"]
+
+
+def test_trails_are_not_pruned_while_the_hook_is_unhealthy(server, tmp_path):
+    port, backend = server
+    old = write_trail(tmp_path / "trace", SID_A, [{"ts": 10, "event": "SessionEnd", "tmux_session": "x"}],
+                      mtime=time.time() - 400 * 86400)
+    wired_backend(backend, tmp_path, wire=False)
+    call(port, "GET", "/api/state", token=backend.token)
+    assert old.exists()
+    wired_backend(backend, tmp_path, wire=True)
+    call(port, "GET", "/api/state", token=backend.token)
+    assert not old.exists()
+
+
+def test_default_backend_hook_health_uses_the_installed_paths(backend, monkeypatch):
+    from kalmux import tmsetup
+    hooks = tmserver.default_hook_health()
+    assert (hooks.settings_path, hooks.wrapper, hooks.state_dir) == (tmsetup.DEFAULT_SETTINGS, tmsetup.WRAPPER, tmsetup.STATE_DIR)
+    seen = []
+    monkeypatch.setattr(tmhooks, "wire_claude_hooks", lambda *a, **kw: seen.append((a, kw)) or "ok")
+    assert tmserver.default_repair_hooks() == "ok"
+    assert seen[0][0] == (tmsetup.DEFAULT_SETTINGS, tmsetup.WRAPPER, tmsetup.STATE_DIR)
+    assert seen[0][1] == {"hook_link": tmsetup.DEFAULT_HOOK_LINK}

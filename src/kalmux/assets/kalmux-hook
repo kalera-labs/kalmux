@@ -1,25 +1,33 @@
 #!/bin/bash
-# cc-status-tmux — Claude Code hook -> tmux user options + iTerm2 Session Status.
+# kalmux-hook: Claude Code hook -> tmux user options, trails, identity tab color, alerts.
 #
-# Why: iTerm2 3.7's bundled `cc-status` targets the iTerm2 session named by ITERM_SESSION_ID.
-# Inside tmux every pane inherits the SAME stale value (the first control-mode gateway), so all
-# Claude sessions report their status to one hidden tab. This wrapper fixes that by:
-#   1. writing the state into tmux user options on the pane (@cc_state, @cc_detail, @cc_since,
-#      @cc_event) — readable by `tm ls`, the tmux status line and any remote attach;
-#   2. writing iTerm2 escape sequences (OSC 21337 status, OSC 1337 SetUserVar, OSC 6 tab color)
-#      straight into the pane's tty — they pass through tmux -CC and land on the right session.
-# Outside tmux it delegates to the original cc-status unchanged.
-# Contract: never block, never fail — a hook must not slow down or break Claude Code.
+# Claude Code runs this from Kalmux's OWN entries in ~/.claude/settings.json (one per event, written by
+# `kalmux setup`), in parallel with iTerm2's own cc-status entries, which Kalmux leaves alone. The command
+# never contains the word "cc-status": iTerm2 manages every entry that does.
+# Inside tmux it:
+#   1. writes the state into tmux user options on the pane (@cc_state, @cc_detail, @cc_since, @cc_event),
+#      readable by `kalmux ls`, the tmux status line and any remote attach;
+#   2. appends lifecycle events to the session's trail (what `kalmux dead` / `kalmux resume` read);
+#   3. writes iTerm2 escape sequences straight into the pane's tty: the identity tab color (OSC 6), the
+#      alert Claude cannot post from inside tmux (OSC 9) and, only with --status=kalmux, the Claude status
+#      itself (OSC 21337 + SetUserVar). With --status=iterm2 (setup picks it when iTerm2 >= 3.7.5 has its
+#      own hooks) iTerm2 reports the status of tmux panes itself, so there is only ever one writer.
+# Outside tmux it only records the heartbeat: iTerm2's own entry does the rest.
+# Every event, before any early exit, touches ${KALMUX_STATE_DIR}/hook.heartbeat and, when the payload names
+# its session, ${KALMUX_STATE_DIR}/hooks/<session_id>: their mtimes tell the Kalmux server (and `kalmux
+# doctor`) that hooks still reach Kalmux, and from which Claude sessions.
+# Contract: never block, never fail. A hook must not slow down or break Claude Code.
 #
-# The tty write is rare on purpose (phase 4): only a state change, a clear, or an event the user
-# must see (PermissionRequest / Notification / Stop / StopFailure / AskUserQuestion) reaches the
-# screen. A tool call while already working updates tmux options only — no escape sequence, no
-# jitter. Lifecycle events also append one JSON line to the session's trail, which is what
-# `kalmux dead` / `kalmux resume` read after a session is gone.
+# The tty write is rare on purpose: only a state change, a clear, or an event the user must see
+# (PermissionRequest / Notification / Stop / StopFailure / AskUserQuestion) reaches the screen. A tool
+# call while already working updates tmux options only: no escape sequence, no jitter.
 set -u
 export LC_ALL=en_US.UTF-8   # unconditional: bash substring/tr must count characters, not bytes
 
-ORIG="${CC_STATUS_ORIG:-/Applications/iTerm.app/Contents/Resources/utilities/cc-status}"
+STATUS_MODE=kalmux
+for arg in "$@"; do
+  case "$arg" in --status=iterm2) STATUS_MODE=iterm2 ;; --status=kalmux) STATUS_MODE=kalmux ;; esac
+done
 MAX_DETAIL=120
 MAX_TRAIL=200                           # cap for the free text stored in a trail line
 MAX_ALERT=200                           # cap for the text of an OSC 9 alert
@@ -30,18 +38,37 @@ COLOR_WAITING='#5f87ff'
 COLOR_IDLE_DOT='#00d75f'
 COLOR_IDLE_TEXT='#888888'
 US=$'\x1f'
-H2='[0-9a-f][0-9a-f]'                   # bash 3.2 has no reliable quoted =~; match the UUID with a glob
+HEX='[0123456789abcdef]'                # spelled out: under a UTF-8 locale [a-f] also matches A-F
+H2="$HEX$HEX"                           # bash 3.2 has no reliable quoted =~; match the UUID with a glob
 UUID_GLOB="$H2$H2$H2$H2-$H2$H2-$H2$H2-$H2$H2-$H2$H2$H2$H2$H2$H2"
 
+STATE_DIR="${KALMUX_STATE_DIR:-${HOME:-}/.local/state/kalmux}"
+
+# --- heartbeat, first: a truncating redirect is a builtin (no fork) and updates the mtime atomically ---
+{ [ -d "$STATE_DIR" ] || mkdir -p -m 700 "$STATE_DIR"; } 2>/dev/null && { : > "$STATE_DIR/hook.heartbeat"; } 2>/dev/null
+
 # Read ALL of stdin: a truncated payload is invalid JSON, so jq would drop the whole event (a long
-# last_assistant_message is trimmed later by sanitize, never by cutting the JSON in half).
+# last_assistant_message is trimmed later by sanitize, never by cutting the JSON in half). Read even when
+# the event is skipped below, so Claude Code never writes into a closed pipe.
 input="$(cat 2>/dev/null)" || input=""
 
-# --- outside tmux: keep iTerm2's native behaviour ------------------------------------------
-if [ -z "${TMUX_PANE:-}" ]; then
-  if [ -x "$ORIG" ]; then printf '%s' "$input" | "$ORIG" "$@" 2>/dev/null; fi
-  exit 0
-fi
+# --- the session's own heartbeat: ${STATE}/hooks/<session_id> tells the server WHICH Claude sessions reach
+# Kalmux (a session that never reports is the failure worth an alarm). Builtins only, and only over the head
+# of the payload: Claude Code sends session_id first, and bash pattern removal is quadratic on a long string.
+payload_head="${input:0:512}" sid_key='"session_id":"' sid_key_spaced='"session_id": "' sid=""
+case "$payload_head" in
+  *"$sid_key"*)        sid="${payload_head#*"$sid_key"}" ;;
+  *"$sid_key_spaced"*) sid="${payload_head#*"$sid_key_spaced"}" ;;
+esac
+[ "${sid:36:1}" = '"' ] || sid=""        # the whole value, not the head of something longer
+sid="${sid:0:36}"
+case "$sid" in
+  $UUID_GLOB) { [ -d "$STATE_DIR/hooks" ] || mkdir -m 700 "$STATE_DIR/hooks"; } 2>/dev/null \
+                && { : > "$STATE_DIR/hooks/$sid"; } 2>/dev/null ;;
+esac
+
+# --- outside tmux: iTerm2's own entry handles this session -----------------------------------
+[ -n "${TMUX_PANE:-}" ] || exit 0
 
 command -v jq >/dev/null 2>&1 || exit 0
 command -v tmux >/dev/null 2>&1 || exit 0
@@ -115,7 +142,7 @@ alert_text() {
 append_trail() {
   local key="$1" value="$2" dir line
   case "$session_id" in $UUID_GLOB) ;; *) return 0 ;; esac
-  dir="${KALMUX_STATE_DIR:-${HOME:-}/.local/state/kalmux}/trace"
+  dir="$STATE_DIR/trace"
   [ -d "$dir" ] || mkdir -p -m 700 "$dir" 2>/dev/null || return 0
   line="$(jq -c -n --arg ts "$now" --arg event "$event" --arg session_id "$session_id" \
       --arg tmux_session "$tmux_session" --arg pane "$P" --arg cwd "$cwd" --arg color "$tm_color" \
@@ -207,7 +234,9 @@ if [ -n "$alert" ]; then                 # first: it is the point of this write
   seq="$seq$(printf '\033]9;%s\007' "$alert")"
   [ "$(notify_setting bell)" = "true" ] && seq="$seq$(printf '\007')"
 fi
-if [ "$clear" = 1 ]; then
+if [ "$STATUS_MODE" = iterm2 ]; then
+  :                                      # iTerm2's own hook reports the status of this tmux pane
+elif [ "$clear" = 1 ]; then
   seq="$seq$(printf '\033]21337;status=;indicator=;status-color=;detail=\033\\\033]1337;SetUserVar=cc_state=\007')"
 else
   case "$state" in
@@ -227,6 +256,7 @@ if [ ${#hex} -eq 6 ] && [ -z "${hex//[0-9a-fA-F]/}" ]; then
   r=$((16#${hex:0:2})); g=$((16#${hex:2:2})); b=$((16#${hex:4:2}))
   seq="$seq$(printf '\033]6;1;bg;red;brightness;%d\007\033]6;1;bg;green;brightness;%d\007\033]6;1;bg;blue;brightness;%d\007' "$r" "$g" "$b")"
 fi
+[ "$seq" != "$(printf '\033\\')" ] || exit 0   # nothing but the leading ST (--status=iterm2): leave the tty alone
 
 # Non-blocking, best-effort write: a paused control-mode client can stop draining the pty and a
 # plain redirect would then hang this hook (and Claude) indefinitely.

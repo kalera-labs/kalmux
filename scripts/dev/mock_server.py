@@ -47,7 +47,7 @@ def pane(pid: str, win: str, **kw) -> dict:
     p = {
         "pane": f"{win}.{pid}", "window_id": win, "pane_id": pid, "claude": True,
         "state": "idle", "source": "hook", "detail": "", "title": "", "age": 0,
-        "stale": False, "path": "", "guid": "", "iterm2_window": "", "iterm2_tab": "", "active": True,
+        "overdue": False, "status_age": None, "path": "", "guid": "", "iterm2_window": "", "iterm2_tab": "", "active": True,
     }
     p.update(kw)
     return p
@@ -62,7 +62,7 @@ def seed() -> list:
     return [
         {
             "name": "api", "color": "#0a84ff", "attached": 1, "in_iterm2": True,
-            "ctx_pct": 42, "model": "Opus 5", "cost_usd": 1.23,
+            "ctx_pct": 42, "model": "Opus 5", "cost_usd": 1.23, "status_age": 8,
             "state": "working", "since": t - 12, "source": "hook", "detail": "Bash",
             "title": "\u2733 Rate limiting for the public endpoints", "path": "~/code/api",
             "project": "api",
@@ -73,7 +73,7 @@ def seed() -> list:
         },
         {
             "name": "web", "color": "#bf5af2", "attached": 1, "in_iterm2": True,
-            "ctx_pct": 71, "model": "Sonnet 5", "cost_usd": 0.42,
+            "ctx_pct": 71, "model": "Sonnet 5", "cost_usd": 0.42, "status_age": 30,
             "state": "waiting", "since": t - 47, "source": "hook", "detail": "Allow Edit?",
             "title": "\u2733 Dark mode for the settings screen",
             "path": "~/code/web", "project": "web",
@@ -85,14 +85,14 @@ def seed() -> list:
         },
         {
             "name": "worker", "color": "#30d158", "attached": 1, "in_iterm2": True,
-            "ctx_pct": 93, "model": "Opus 5", "cost_usd": 7.8,
+            "ctx_pct": 93, "model": "Opus 5", "cost_usd": 7.8, "status_age": 2300, "overdue": True,
             "state": "working", "since": t - 2340, "source": "hook",
             "detail": "Edit src/queue/retry.ts",
             "title": "\u2733 Make the retry queue idempotent",
             "path": "~/code/worker", "project": "worker",
             "panes": [
                 pane("%0", "@1", state="working", detail="Edit src/queue/retry.ts",
-                     title="\u2733 Make the retry queue idempotent", age=2340, stale=True,
+                     title="\u2733 Make the retry queue idempotent", age=2340, overdue=True,
                      path="~/code/worker", guid="C31D7742-58DD-4ADD-9F17-7D0CBC0682D7",
                      iterm2_window="pty-13D0AA91", iterm2_tab="7"),
                 pane("%1", "@1", state="waiting", detail="Allow Bash(pytest -q)?",
@@ -103,7 +103,7 @@ def seed() -> list:
         },
         {
             "name": "docs", "color": "", "attached": 2, "in_iterm2": False,
-            "ctx_pct": 12, "model": "Haiku 4.5", "cost_usd": 0.03,
+            "ctx_pct": 12, "model": "Haiku 4.5", "cost_usd": 0.03, "status_age": 5 * 3600,
             "state": "idle", "since": t - 410, "source": "registry",
             "detail": "\u2713 Done: the API reference is regenerated", "title": "",
             "path": "~/code/docs", "project": "docs",
@@ -129,10 +129,19 @@ def seed() -> list:
                            iterm2_window="pty-13D0AA91", iterm2_tab="9")],
         },
         {
-            "name": "dotfiles", "color": "", "attached": 0, "in_iterm2": False,
+            # recreated by a restore with [restore] open_tabs = false: no tab until someone opens it
+            "name": "dotfiles", "color": "", "attached": 0, "in_iterm2": False, "restored_at": t - 240,
             "state": "", "since": None, "source": "hook", "detail": "", "title": "",
             "path": "~/.dotfiles", "project": ".dotfiles",
             "panes": [pane("%0", "@0", claude=False, state="", path="~/.dotfiles")],
+        },
+        {
+            # restored too, but its folder sits on a USB volume that was not mounted yet: it waits in ~
+            "name": "reels", "color": "#ff9500", "attached": 0, "in_iterm2": False, "restored_at": t - 240,
+            "cwd_fallback": "/Volumes/Ext/code/reels",
+            "state": "", "since": None, "source": "", "detail": "", "title": "",
+            "path": "~", "project": "~",
+            "panes": [pane("%0", "@0", claude=False, state="", path="~")],
         },
     ]
 
@@ -155,6 +164,30 @@ QUOTA = {"five_hour": {"used_pct": 64, "resets_at": _now() + 3600},
          "seven_day": {"used_pct": 22, "resets_at": _now() + 4 * 86400}}
 SESSIONS = seed()
 TOMBSTONES = seed_tombstones()
+IDLE_OPENING = {"running": False, "done": 0, "failed": 0, "total": 0}
+BATCH = {"opening": dict(IDLE_OPENING), "now": ""}   # the "Open all" batch, as /api/state reports it
+OPEN_EVERY = 0.7                      # seconds per tab, slow enough to watch the progress line
+# KALMUX_MOCK_OPEN_FAIL=N: the first N tabs of an Open all fail, to show the failure line and toast
+OPEN_FAIL = int(os.environ.get("KALMUX_MOCK_OPEN_FAIL", "0") or 0)
+SILENT_REASON = ("No hook event from Claude in reels, api since the hooks were wired. Restart a session that "
+                 "still does not report (it may predate the wiring); if none report, run Repair (or "
+                 "`kalmux doctor --fix`).")
+
+
+def seed_hook() -> dict:
+    """data.hook: healthy, unless KALMUX_MOCK_HOOK asks for the red banner: `broken` (entries missing,
+    Repair fixes it) or `silent` (entries in place, two sessions never reported: Repair cannot help)."""
+    mode = os.environ.get("KALMUX_MOCK_HOOK")
+    if mode == "broken":
+        return {"ok": False, "last_seen": _now() - 3 * 3600,
+                "reason": "Claude Code does not call Kalmux's hook: no Kalmux entry in settings.json for any "
+                          "hook event (settings.json)."}
+    if mode == "silent":
+        return {"ok": False, "last_seen": _now() - 40, "reason": SILENT_REASON}
+    return {"ok": True, "last_seen": _now() - 4, "reason": ""}
+
+
+HOOK = seed_hook()
 
 
 # ---------------------------------------------------------------- snapshot
@@ -171,16 +204,20 @@ def snapshot() -> dict:
         out.append({
             "name": s["name"], "color": s["color"], "attached": s["attached"],
             "in_iterm2": s["in_iterm2"], "state": s["state"], "age": age,
-            "stale": bool(s["state"] in ("working", "waiting") and age and age > 1800),
+            "overdue": bool(s.get("overdue")),
             "source": s["source"], "detail": s["detail"], "title": s["title"],
             "path": s["path"], "project": s["project"], "panes": panes,
-            "claude_session_id": s.get("claude_session_id", ""), "ctx_pct": s.get("ctx_pct"),
+            "claude_session_id": s.get("claude_session_id", ""), "ctx_pct": s.get("ctx_pct"), "status_age": s.get("status_age"),
             "model": s.get("model", ""), "cost_usd": s.get("cost_usd"), "quota": QUOTA if s.get("model") else None,
+            "restored": waiting(s), "restored_at": s.get("restored_at") if waiting(s) else None,
+            "cwd_fallback": s.get("cwd_fallback", ""),
         })
     counts = dict.fromkeys(("waiting", "working", "idle", "busy", "unknown", "stale", "gone"), 0)
+    counts["overdue"] = 0
     for s in out:
         if s["state"] in counts:
             counts[s["state"]] += 1
+        counts["overdue"] += bool(s["overdue"])
     counts["total"] = len(out)
     return {
         "now": t,
@@ -189,8 +226,22 @@ def snapshot() -> dict:
         "counts": counts,
         "sessions": out,
         "quota": QUOTA,
+        "restored": restored_summary(out),
         "tombstones": list(TOMBSTONES),
+        "hook": dict(HOOK),
     }
+
+
+def waiting(s) -> bool:
+    """Restored and nobody attached yet: what @kalmux_restored plus session_attached say on the real server."""
+    return bool(s.get("restored_at")) and not s["attached"]
+
+
+def restored_summary(rows) -> dict:
+    marked = [r for r in rows if r["restored"]]
+    return {"count": len(marked), "at": max((r["restored_at"] for r in marked), default=None),
+            "names": [r["name"] for r in marked], "fallbacks": sum(1 for r in rows if r["cwd_fallback"]),
+            "opening": dict(BATCH["opening"])}
 
 
 def find(name):
@@ -198,7 +249,8 @@ def find(name):
 
 
 def attach_tab(s) -> None:
-    """Pretend to open a new iTerm2 tab for the session."""
+    """Pretend to open a new iTerm2 tab for the session (which also clears its restored mark)."""
+    s.pop("restored_at", None)
     s["in_iterm2"] = True
     s["attached"] += 1
     for p in s["panes"]:
@@ -213,6 +265,8 @@ def act_go(b):
     s = find(b.get("session", ""))
     if not s:
         return 404, False, "No session named {!r}".format(b.get("session", "")), {}
+    if s["name"] == BATCH["now"]:
+        return 400, False, f"Open all is opening {s['name']} right now", {}
     if s["in_iterm2"]:
         return 200, True, "Jumped to {}".format(s["name"]), {"opened": False}
     attach_tab(s)
@@ -223,6 +277,8 @@ def act_open(b):
     s = find(b.get("session", ""))
     if not s:
         return 404, False, "No such session", {}
+    if s["name"] == BATCH["now"]:
+        return 400, False, f"Open all is opening {s['name']} right now", {}
     attach_tab(s)
     return 200, True, "Opened another tab for {}".format(s["name"]), {"opened": True}
 
@@ -338,6 +394,59 @@ def act_forget(b):
     return 200, True, f"Forgot {t['session_id']}", {}
 
 
+def act_open_restored(_b):
+    """Open all: one tab per waiting session, on a thread, one every OPEN_EVERY seconds."""
+    if BATCH["opening"]["running"]:
+        return 400, False, "already opening the restored sessions", dict(BATCH["opening"])
+    names = [s["name"] for s in SESSIONS if waiting(s)]
+    if not names:
+        return 400, False, "no restored session is waiting for a tab", {}
+    BATCH["opening"] = {**IDLE_OPENING, "running": True, "total": len(names)}
+
+    def run():
+        for i, name in enumerate(names):
+            with LOCK:
+                s = find(name)
+                if not (s and waiting(s)):         # opened by a click or dismissed meanwhile: no second tab
+                    BATCH["opening"] = {**BATCH["opening"], "total": BATCH["opening"]["total"] - 1}
+                    continue
+                BATCH["now"] = name
+            time.sleep(OPEN_EVERY)
+            with LOCK:
+                ok = i >= OPEN_FAIL
+                if ok:
+                    attach_tab(s)
+                key = "done" if ok else "failed"
+                BATCH["opening"], BATCH["now"] = {**BATCH["opening"], key: BATCH["opening"][key] + 1}, ""
+        BATCH["opening"] = {**BATCH["opening"], "running": False}
+
+    threading.Thread(target=run, daemon=True).start()
+    return 200, True, f"opening {len(names)} restored session(s)", {"total": len(names), "names": names}
+
+
+def act_dismiss_restored(b):
+    name = b.get("session", "")
+    if not isinstance(name, str):
+        return 400, False, "session must be a session name", {}
+    marked = [s for s in SESSIONS if waiting(s) and (not name or s["name"] == name)]
+    if not marked:
+        return 400, False, "no restored session is waiting for a tab", {}
+    for s in marked:
+        s.pop("restored_at", None)
+    return 200, True, f"dismissed {len(marked)} restored session(s)", {"dismissed": [s["name"] for s in marked]}
+
+
+def act_repair_hooks(_b):
+    if HOOK["reason"] == SILENT_REASON:          # nothing to write: the sessions themselves never reported
+        return 200, True, ("Claude Code hooks: already had 9 event entries, status by iTerm2. The hooks are still "
+                           f"not reaching Kalmux: {SILENT_REASON}"), {"hook": dict(HOOK)}
+    HOOK.update(ok=True, last_seen=_now(), reason="")
+    return 200, True, ("Claude Code hooks: wrote 9 event entries, status by iTerm2; backup in "
+                       "~/.claude/settings.json.hooks.bak-kalmux; running Claude sessions pick the entries up when "
+                       "Claude Code reloads its settings: restart one only if Kalmux still says it does not report"), \
+        {"hook": dict(HOOK)}
+
+
 def act_mock(body):
     """Development only: patch a session in place so a demo (or a recording) can show state changing.
 
@@ -367,6 +476,8 @@ ROUTES = {
     "/api/new": act_new, "/api/kill": act_kill, "/api/rename": act_rename,
     "/api/detach": act_detach, "/api/next-waiting": act_next_waiting,
     "/api/resume": act_resume, "/api/forget": act_forget,
+    "/api/open-restored": act_open_restored, "/api/dismiss-restored": act_dismiss_restored,
+    "/api/repair-hooks": act_repair_hooks,
 }
 
 

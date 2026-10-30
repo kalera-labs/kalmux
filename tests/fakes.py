@@ -5,15 +5,16 @@ import json
 import os
 import pathlib
 
-from kalmux.tmcore import FIELDS, SEP
+from kalmux.tmcore import FIELDS, INTENDED_OPTION, RESTORED_OPTION, SEP
 
 
 def pane(session, pane_id="%1", window_id="@1", state="", detail="", since="", title="✳ x", path="/Volumes/Dev/proj",
-         cmd="2.1.270", color="", attached="1", active=True, tty="", start_cmd="", shell="/bin/zsh", dead="0"):
+         cmd="2.1.270", color="", attached="1", active=True, tty="", start_cmd="", shell="/bin/zsh", dead="0",
+         restored="", intended=""):
     return {"session": session, "window_id": window_id, "pane_id": pane_id, "cc_state": state, "cc_detail": detail,
             "cc_since": since, "title": title, "path": path, "cmd": cmd, "tm_color": color, "attached": attached,
             "window_active": "1" if active else "0", "pane_active": "1" if active else "0", "tty": tty,
-            "start_cmd": start_cmd, "shell": shell, "dead": dead}
+            "start_cmd": start_cmd, "shell": shell, "dead": dead, "restored": restored, "intended": intended}
 
 
 def tmux_line(p: dict) -> str:
@@ -38,6 +39,8 @@ class FakeTmux:
     def __init__(self, panes=None, colors=None, tty=None, pid=4242, started=1_790_000_000):
         self.panes = [dict(p) for p in (panes or [])]
         self.colors = colors or {}
+        # every other session user option (@kalmux_restored, @kalmux_cwd), keyed (session, option)
+        self.options: dict[tuple[str, str], str] = {}
         self.calls = []
         self.tty = tty
         self.fail: set[str] = set()
@@ -54,7 +57,10 @@ class FakeTmux:
         return self
 
     def list_panes(self):
-        return [dict(p) for p in self.panes]
+        """The panes, with the session options a `#{@option}` format would resolve for each of them."""
+        return [{**p, "restored": self.options.get((p["session"], RESTORED_OPTION), p.get("restored", "")),
+                 "intended": self.options.get((p["session"], INTENDED_OPTION), p.get("intended", ""))}
+                for p in self.panes]
 
     def _session_names(self):
         """Session names in the order their first pane appeared (the fake's creation order)."""
@@ -64,6 +70,7 @@ class FakeTmux:
         first = next(p for p in self.panes if p["session"] == name)
         return {"#{session_id}": f"${index}", "#{session_name}": name, "#{pane_current_path}": first["path"],
                 "#{@tm_color}": self.colors.get(name, first.get("tm_color", "")),
+                "#{@kalmux_cwd}": self.options.get((name, INTENDED_OPTION), first.get("intended", "")),
                 "#{session_created}": str(1000 + index)}
 
     def run_rc(self, *args):
@@ -93,7 +100,9 @@ class FakeTmux:
 
     def show_session_option(self, session, name):
         self.calls.append(("show", session, name))
-        return self.colors.get(session, "")
+        if name == "@tm_color":
+            return self.colors.get(session, "")
+        return self.options.get((session, name), "")
 
     def session_id(self, name):
         return next((f"${i}" for i, p in enumerate(self.panes) if p["session"] == name), "")
@@ -102,7 +111,12 @@ class FakeTmux:
         self.calls.append(("set", session, name, value))
         if not self.session_id(session):
             return False
-        self.colors[session] = value
+        if name == "@tm_color":
+            self.colors[session] = value
+        elif value is None:
+            self.options.pop((session, name), None)
+        else:
+            self.options[(session, name)] = value
         return "set" not in self.fail
 
     def pane_tty(self, pane_id):
@@ -132,6 +146,7 @@ class FakeTmux:
         if "kill" in self.fail:
             return False
         self.panes = [p for p in self.panes if p["session"] != name]
+        self.options = {k: v for k, v in self.options.items() if k[0] != name}
         return True
 
     def rename_session(self, old, new):
@@ -141,6 +156,7 @@ class FakeTmux:
         for p in self.panes:
             if p["session"] == old:
                 p["session"] = new
+        self.options = {((new if s == old else s), o): v for (s, o), v in self.options.items()}
         return True
 
     def detach_session(self, name):
@@ -217,7 +233,7 @@ def it2_json(rows) -> str:
 
 
 def write_trail(directory, session_id, lines, mtime=None):
-    """Write a real trail file (the jsonl bin/cc-status-tmux appends) and return its path.
+    """Write a real trail file (the jsonl assets/kalmux-hook appends) and return its path.
 
     Items of `lines` are dicts (serialised) or raw strings (written verbatim, for malformed lines)."""
     directory = pathlib.Path(directory)

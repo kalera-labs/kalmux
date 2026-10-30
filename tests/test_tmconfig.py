@@ -122,7 +122,7 @@ def test_ensure_config_leaves_the_legacy_file_alone_when_a_new_one_exists(tmp_pa
 
 def test_restore_enabled_is_a_bool_that_defaults_to_true(tmp_path):
     path = tmp_path / "config.toml"
-    assert tmconfig.load_config(path)["restore"] == {"enabled": True}
+    assert tmconfig.load_config(path)["restore"] == {"enabled": True, "open_tabs": False}
     path.write_text("[restore]\nenabled = false\n")
     cfg = tmconfig.load_config(path)
     assert cfg["_errors"] == [] and cfg["restore"]["enabled"] is False
@@ -136,7 +136,8 @@ def test_bad_restore_values_fall_back_to_the_default(tmp_path, body, expect):
     path = tmp_path / "config.toml"
     path.write_text(body)
     cfg = tmconfig.load_config(path)
-    assert cfg["restore"] == {"enabled": True} and any(expect in e for e in cfg["_errors"]), cfg["_errors"]
+    assert cfg["restore"] == {"enabled": True, "open_tabs": False}
+    assert any(expect in e for e in cfg["_errors"]), cfg["_errors"]
 
 
 def test_notify_values_are_honoured_and_described(tmp_path):
@@ -146,3 +147,29 @@ def test_notify_values_are_honoured_and_described(tmp_path):
     assert cfg["_errors"] == [] and cfg["notify"] == {"iterm2": "never", "bell": True}
     assert "notify.iterm2 = 'never'" in tmconfig.describe(cfg)
     assert tmconfig.NOTIFY_MODES == ("auto", "always", "never")
+
+
+# ---------- [restore] open_tabs ----------
+def test_restore_open_tabs_defaults_to_off_and_the_template_says_so(tmp_path):
+    assert tmconfig.DEFAULTS["restore"] == {"enabled": True, "open_tabs": False}
+    path = tmp_path / "config.toml"
+    tmconfig.ensure_config(path)
+    cfg = tmconfig.load_config(path)
+    assert cfg["restore"]["open_tabs"] is False and cfg["_errors"] == []
+    assert "open_tabs = false" in tmconfig.CONFIG_TEMPLATE
+    assert "restore.open_tabs = False" in tmconfig.describe(cfg)
+
+
+def test_restore_open_tabs_is_a_strict_bool(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text("[restore]\nopen_tabs = true\n")
+    assert tmconfig.load_config(path)["restore"]["open_tabs"] is True
+    path.write_text('[restore]\nopen_tabs = "yes"\nenabled = false\n')
+    cfg = tmconfig.load_config(path)
+    assert cfg["restore"] == {"enabled": False, "open_tabs": False}
+    assert cfg["_errors"] == ["restore.open_tabs: expected true or false"]
+
+
+def test_the_restore_section_of_the_template_has_no_long_dashes():
+    section = tmconfig.CONFIG_TEMPLATE.split("[restore]")[1]
+    assert "\u2014" not in section and "\u2013" not in section

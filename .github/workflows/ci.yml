@@ -52,9 +52,9 @@ jobs:
           import glob, zipfile
           wheel = glob.glob("dist/*.whl")[0]
           names = {i.filename: (i.external_attr >> 16) & 0o777 for i in zipfile.ZipFile(wheel).infolist()}
-          for want in ("kalmux/assets/cc-status-tmux", "kalmux/assets/index.html", "kalmux/assets/it2_toolbelt.py"):
+          for want in ("kalmux/assets/kalmux-hook", "kalmux/assets/index.html", "kalmux/assets/it2_toolbelt.py"):
               assert want in names, f"{want} missing from {wheel}"
-          mode = names["kalmux/assets/cc-status-tmux"]
+          mode = names["kalmux/assets/kalmux-hook"]
           assert mode & 0o111, f"the hook is not executable in the wheel ({mode:o})"
           print("wheel ok:", wheel)
           PY

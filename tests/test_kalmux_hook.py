@@ -1,13 +1,16 @@
-"""End-to-end tests for the cc-status-tmux hook wrapper."""
+"""End-to-end tests for the kalmux-hook wrapper (assets/kalmux-hook)."""
 import base64
 import json
+import os
+import shutil
 import subprocess
+import time
 
 import pytest
 
 from conftest import ASSETS
 
-WRAPPER = ASSETS / "cc-status-tmux"
+WRAPPER = ASSETS / "kalmux-hook"
 ESC = "\x1b"
 BEL = "\x07"
 
@@ -144,14 +147,13 @@ def test_ignored_events_do_nothing(fake_env):
     assert tty_bytes(fake_env) == ""
 
 
-def test_outside_tmux_delegates_to_original(fake_env):
-    env = {"TMUX_PANE": "", "TMUX": ""}
+def test_outside_tmux_exits_quietly_and_never_chains_to_iterm2(fake_env):
+    """iTerm2's own entry runs in parallel now: calling its cc-status too would post every status twice."""
     payload = {"hook_event_name": "Stop", "last_assistant_message": "hi"}
-    r = run_hook(fake_env, payload, extra_env=env)
-    assert r.returncode == 0
-    orig = fake_env["orig_log"].read_text()
-    assert "STDIN: " + json.dumps(payload) in orig
-    assert "@cc_state" not in tmux_log(fake_env)
+    r = run_hook(fake_env, payload, extra_env={"TMUX_PANE": "", "TMUX": ""})
+    assert r.returncode == 0 and r.stdout == "" and r.stderr == ""
+    assert not fake_env["orig_log"].exists()
+    assert tmux_log(fake_env) == "" and tty_bytes(fake_env) == ""
 
 
 def test_tmux_failure_still_exits_zero(fake_env):
@@ -494,3 +496,114 @@ def test_kalmux_config_env_points_the_hook_at_another_file(fake_env):
     other.write_text('[notify]\niterm2 = "never"\n')
     notif(fake_env, "m", extra_env={"KALMUX_CONFIG": str(other)})
     assert ESC + "]9;" not in tty_bytes(fake_env)
+
+
+# ---------- heartbeat: proof that hooks still reach Kalmux ----------
+def heartbeat(fake_env):
+    return fake_env["state"] / "hook.heartbeat"
+
+
+@pytest.mark.parametrize("payload,extra", [
+    ({"hook_event_name": "Stop"}, {}),
+    ({"hook_event_name": "Stop"}, {"TMUX_PANE": "", "TMUX": ""}),          # outside tmux
+    ({"hook_event_name": "SubagentStop"}, {}),                             # an event the hook ignores
+    (None, {}),                                                            # not even JSON
+    ({"hook_event_name": "Stop"}, {"FAKE_TMUX_FAIL": "1"}),
+])
+def test_every_event_touches_the_heartbeat_before_any_early_exit(fake_env, payload, extra):
+    r = run_hook(fake_env, payload, extra_env=extra, raw="garbage" if payload is None else None)
+    assert r.returncode == 0
+    hb = heartbeat(fake_env)
+    assert hb.exists() and abs(hb.stat().st_mtime - time.time()) < 30
+    assert oct(fake_env["state"].stat().st_mode)[-3:] == "700"
+
+
+def test_heartbeat_is_refreshed_by_the_next_event(fake_env):
+    run_hook(fake_env, {"hook_event_name": "Stop"})
+    os.utime(heartbeat(fake_env), (1_000_000, 1_000_000))
+    run_hook(fake_env, {"hook_event_name": "UserPromptSubmit"})
+    assert heartbeat(fake_env).stat().st_mtime > 1_000_000
+
+
+SID = "0a1b2c3d-0000-4000-8000-00000000abcd"
+
+
+@pytest.mark.parametrize("raw,extra", [
+    (json.dumps({"session_id": SID, "hook_event_name": "Stop"}, separators=(",", ":")), {}),
+    (json.dumps({"session_id": SID, "hook_event_name": "Stop"}), {}),                  # "key": "value"
+    (json.dumps({"session_id": SID, "hook_event_name": "Stop"}), {"TMUX_PANE": "", "TMUX": ""}),
+])
+def test_every_event_touches_its_sessions_own_heartbeat(fake_env, raw, extra):
+    assert run_hook(fake_env, None, extra_env=extra, raw=raw).returncode == 0
+    own = fake_env["state"] / "hooks" / SID
+    assert own.exists() and abs(own.stat().st_mtime - time.time()) < 30
+    assert oct((fake_env["state"] / "hooks").stat().st_mode)[-3:] == "700"
+
+
+@pytest.mark.parametrize("session_id", ["../../escape", "0a1b2c3d", "", "0A1B2C3D-0000-4000-8000-00000000ABCD/x"])
+def test_a_session_id_that_is_not_a_uuid_writes_no_file(fake_env, session_id):
+    run_hook(fake_env, {"session_id": session_id, "hook_event_name": "Stop"})
+    beats = fake_env["state"] / "hooks"
+    assert not beats.exists() or list(beats.iterdir()) == []
+    assert not (fake_env["state"].parent / "escape").exists()
+
+
+def test_heartbeat_without_jq_on_path(fake_env, tmp_path):
+    """jq missing makes the hook give up, but the heartbeat still says the hook ran."""
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    for tool in ("bash", "cat", "mkdir"):
+        (bare / tool).symlink_to(shutil.which(tool))
+    r = run_hook(fake_env, {"hook_event_name": "Stop"}, extra_env={"PATH": str(bare)})
+    assert r.returncode == 0 and heartbeat(fake_env).exists()
+
+
+def test_unwritable_state_dir_keeps_the_hook_silent(fake_env):
+    blocked = fake_env["tmp"] / "file-not-dir"
+    blocked.write_text("")
+    r = run_hook(fake_env, {"hook_event_name": "Stop"}, extra_env={"KALMUX_STATE_DIR": str(blocked / "x")})
+    assert r.returncode == 0 and r.stderr == ""
+
+
+# ---------- --status=iterm2: iTerm2's own hook writes the Claude status ----------
+def run_native(fake_env, payload, extra_env=None):
+    env = dict(fake_env["env"], **(extra_env or {}))
+    return subprocess.run([str(WRAPPER), "--status=iterm2"], input=json.dumps(payload), text=True, env=env,
+                          capture_output=True, timeout=20, check=False)
+
+
+def test_native_mode_writes_no_status_escapes_but_keeps_tmux_state(fake_env):
+    r = run_native(fake_env, {"hook_event_name": "UserPromptSubmit", "session_id": UUID})
+    assert r.returncode == 0
+    assert "@cc_state working" in tmux_log(fake_env)
+    out = tty_bytes(fake_env)
+    assert "]21337;" not in out and "SetUserVar" not in out
+
+
+def test_native_mode_keeps_the_identity_color_and_the_alert(fake_env):
+    run_native(fake_env, {"hook_event_name": "Notification", "notification_type": "permission_prompt",
+                          "message": "Claude needs your permission"}, {"FAKE_TM_COLOR": "#ff8800"})
+    out = tty_bytes(fake_env)
+    assert osc9("Claude needs your permission") in out
+    assert f"{ESC}]6;1;bg;red;brightness;255{BEL}" in out
+    assert "]21337;" not in out
+
+
+def test_native_mode_session_end_leaves_the_status_to_iterm2(fake_env):
+    run_native(fake_env, {"hook_event_name": "SessionEnd", "reason": "exit", "session_id": UUID})
+    assert "-u @cc_state" in tmux_log(fake_env)
+    assert "]21337;" not in tty_bytes(fake_env) and "SetUserVar" not in tty_bytes(fake_env)
+    assert trail_lines(fake_env)[0]["event"] == "SessionEnd"
+
+
+def test_native_mode_without_color_or_alert_writes_nothing(fake_env):
+    run_native(fake_env, {"hook_event_name": "Stop", "last_assistant_message": "done"})
+    assert "@cc_state idle" in tmux_log(fake_env)
+    assert tty_bytes(fake_env) == ""
+
+
+def test_explicit_kalmux_mode_is_the_default_behaviour(fake_env):
+    env = dict(fake_env["env"])
+    subprocess.run([str(WRAPPER), "--status=kalmux"], input=json.dumps({"hook_event_name": "UserPromptSubmit"}),
+                   text=True, env=env, capture_output=True, timeout=20, check=False)
+    assert osc_status("working", "#ff9500", "#ff9500") in tty_bytes(fake_env)

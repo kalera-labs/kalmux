@@ -1,9 +1,13 @@
 """End-to-end tests for the snapshot and the restore against a REAL tmux, on sockets of our own.
 
 SAFETY: every command here goes to `-L kalmux-test-<pid>` or `-L kalmux-crash-<pid>`, never the user's
-server, and nothing ever runs `kill-server` — on 2026-09-14 that command, run from a shell that had
+server, and nothing ever runs `kill-server`: on 2026-09-14 that command, run from a shell that had
 inherited $TMUX, took down every Claude session the user had open. These tests kill only the sessions
 they created; an empty server with `exit-empty off` is let go by turning the option back on.
+
+HERMETIC: every server here starts with `-f /dev/null`. On a machine that ran `kalmux setup`, the user's
+~/.tmux.conf says `set -s exit-empty off`, and a test server that loaded it never went away: the first
+test failed and every run left an empty server behind. A module-wide guard now fails the run if one is.
 """
 import contextlib
 import os
@@ -22,17 +26,43 @@ TMUX_BIN = resolve_tmux()
 SOCKET = f"kalmux-test-{os.getpid()}"
 
 
-@pytest.fixture
-def private_tmux():
-    """A Tmux bound to our own socket. Teardown kills every session we made there, never the server:
-    `kill-server` on a shell that inherited $TMUX would reach the user's real server (incident 2026-09-14).
-    The empty server then stops by itself (`exit-empty on`) and only its socket file is left to tidy up."""
-    tmux = Tmux(socket=SOCKET)
-    yield tmux
+class HermeticTmux(Tmux):
+    """The product's Tmux on our own socket, plus `-f /dev/null` on every call: only the call that starts
+    the server reads a config file, and that one must never be the user's (exit-empty off, hooks)."""
+
+    def _argv(self, args: tuple[str, ...]) -> list[str]:
+        return [self.path, "-L", self.socket, "-f", "/dev/null", *args]
+
+
+def _let_go(tmux: Tmux) -> None:
+    """Kill the sessions we made, put `exit-empty on` back in case a test turned it off, and wait for the
+    empty server to leave by itself. Never kill-server: see SAFETY above."""
     for line in tmux.run("list-sessions", "-F", "#{session_name}").split("\n"):
         if line.strip():
             tmux.kill_session(line.strip())
-    _drop_stale_socket()
+    tmux.run_rc("set", "-s", "exit-empty", "on")
+    _wait_until_no_server(tmux)
+    _drop_stale_socket(tmux.socket)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def no_server_left_behind():
+    """The guard: once this module is done, nothing answers on either of our sockets."""
+    yield
+    for socket in (SOCKET, CRASH_SOCKET):
+        left = Tmux(socket=socket)
+        if tmsnapshot.live_state(left) is not None:
+            _let_go(left)                                    # tidy up first, then still fail the run
+            pytest.fail(f"a test left a tmux server running on -L {socket}")
+
+
+@pytest.fixture
+def private_tmux():
+    """A hermetic Tmux bound to our own socket; the teardown lets its server go (see _let_go)."""
+    tmux = HermeticTmux(socket=SOCKET)
+    yield tmux
+    _let_go(tmux)
+    assert tmsnapshot.live_state(tmux) is None, f"the test left a tmux server running on -L {SOCKET}"
 
 
 def _drop_stale_socket(socket: str = SOCKET):
@@ -73,8 +103,29 @@ def test_end_to_end_snapshot_and_restore_on_a_private_socket(tmp_path, private_t
         assert os.path.realpath(live[name].cwd) == os.path.realpath(directory)
         assert live[name].color == color
     assert tmsnapshot.read_snapshot(previous).boot == 111
+    # [restore] open_tabs is off by default: no tab, and the mark is readable through the pane format
+    assert it2.tabs == [] and set(tmsnapshot.pending_restored(private_tmux.list_panes())) == set(names)
+    # what action_open reads before it clears a mark: `show -t =name` answers for a session user option
+    assert private_tmux.show_session_option(names[0], tmcore.RESTORED_OPTION).isdigit()
+    assert tmrestore.open_tabs(it2, names, socket=SOCKET, on_tab=tmrestore.clearing(private_tmux)) == 2
     assert [c for c, _w in it2.tabs] == [f"""/bin/zsh -lc 'exec tmux -L {SOCKET} -CC attach -t "={n}"'; exit"""
                                          for n in names]
+    assert tmsnapshot.pending_restored(private_tmux.list_panes()) == {}
+
+
+@pytest.mark.skipif(not TMUX_BIN, reason="tmux is not installed")
+def test_end_to_end_a_fallback_keeps_the_intended_directory_in_the_snapshot(tmp_path, private_tmux):
+    """A real tmux: the session starts in $HOME, and its snapshot record still names the directory that
+    was not there (a USB volume that had not mounted yet)."""
+    home, gone = tmp_path / "home", tmp_path / "usb" / "proj"
+    home.mkdir()
+    name = f"e2e-fallback-{os.getpid()}"
+    saved = tmsnapshot.SavedSession(name=name, cwd=str(gone))
+    assert tmrestore.restore(private_tmux, [saved], home=str(home), volume_wait=0) == [name]
+    pane = next(p for p in private_tmux.list_panes() if p["session"] == name)
+    assert os.path.realpath(pane["path"]) == os.path.realpath(home) and pane["intended"] == str(gone)
+    rows = {s.name: s for s in tmsnapshot.live_sessions(private_tmux, home=str(home))}
+    assert rows[name].cwd == str(gone)
 
 
 # ---------- end to end, a tmux server that crashed and came back as another one ----------
@@ -104,16 +155,12 @@ def _wait_until_no_server(tmux: Tmux, timeout: float = 10.0) -> bool:
 
 @pytest.fixture
 def crash_tmux():
-    """A socket of our own for the crash test. It runs with `exit-empty off`, so the teardown kills the
-    sessions it made and then puts the option back: the empty server then exits by itself."""
-    tmux = Tmux(socket=CRASH_SOCKET)
+    """A hermetic socket of our own for the crash test. It runs with `exit-empty off`, so the teardown
+    kills the sessions it made and then puts the option back: the empty server then exits by itself."""
+    tmux = HermeticTmux(socket=CRASH_SOCKET)
     yield tmux
-    for line in tmux.run("list-sessions", "-F", "#{session_name}").split("\n"):
-        if line.strip():
-            tmux.kill_session(line.strip())
-    tmux.run_rc("set", "-s", "exit-empty", "on")
-    _wait_until_no_server(tmux)
-    _drop_stale_socket(CRASH_SOCKET)
+    _let_go(tmux)
+    assert tmsnapshot.live_state(tmux) is None, f"the test left a tmux server running on -L {CRASH_SOCKET}"
 
 
 @pytest.mark.skipif(not TMUX_BIN, reason="tmux is not installed")
@@ -132,7 +179,7 @@ def test_end_to_end_a_crashed_server_is_restored_on_the_next_keeper_round(tmp_pa
 
     path, previous = tmp_path / "sessions.json", tmp_path / "sessions.previous.json"
     it2 = FakeIt2(window="pty-CUR")
-    k = tmrestore.SessionKeeper(crash_tmux, it2, path, previous, boot=111, clock=Clock())
+    k = tmrestore.SessionKeeper(crash_tmux, it2, path, previous, boot=111, clock=Clock(), tabs=True)
     assert k.run_once() is True
     lost = tmsnapshot.read_snapshot(path)
     assert set(lost.names) == set(names) and lost.server.pid > 0
@@ -148,7 +195,7 @@ def test_end_to_end_a_crashed_server_is_restored_on_the_next_keeper_round(tmp_pa
     _start_server(CRASH_SOCKET, names[0], str(first))        # the user starts one of them again by hand
     assert crash_tmux.run_rc("set", "-s", "exit-empty", "off")[0] == 0
     assert tmsnapshot.live_state(crash_tmux).server != lost.server
-    assert k.run_once() is True
+    assert k.run_once() is False                             # handed to the restore; the lost list stays on disk
     k.restorer.join(10)                                      # the restore runs on a thread of its own
 
     back = {s.name: s for s in tmsnapshot.live_state(crash_tmux).sessions}
@@ -158,7 +205,10 @@ def test_end_to_end_a_crashed_server_is_restored_on_the_next_keeper_round(tmp_pa
     kept = tmsnapshot.read_snapshot(previous)
     assert set(kept.names) == set(names) and kept.server == lost.server
     assert [c for c, _w in it2.tabs] == [f"""/bin/zsh -lc 'exec tmux -L {CRASH_SOCKET} -CC attach -t "={names[1]}"'; exit"""]
-    assert k.run_once() is True and set(tmsnapshot.read_snapshot(path).names) == set(names)
+    assert tmsnapshot.pending_restored(crash_tmux.list_panes()) == {}       # its tab opened: no mark left
+    now = tmsnapshot.read_snapshot(path)                     # the restore adopted the new server when it was done
+    assert set(now.names) == set(names) and now.server == tmsnapshot.live_state(crash_tmux).server
+    assert k.run_once() is False                             # and has nothing left to bring back
     assert "restore:" in capsys.readouterr().out
 
 

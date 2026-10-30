@@ -1,5 +1,6 @@
-"""tmsetup — install and verify the machine-side pieces: symlinks, iTerm2 prefs, the ~/.tmux.conf
-managed block, the iTerm2 AutoLaunch script that starts `kalmux ui serve`, and the toolbelt tool.
+"""tmsetup: install and verify the machine-side pieces: Kalmux's Claude Code hook entries (tmhooks), symlinks,
+iTerm2 prefs, the ~/.tmux.conf managed block, the iTerm2 AutoLaunch script that starts `kalmux ui serve`, and
+the toolbelt tool.
 
 Why the server is started BY iTerm2 (AutoLaunch.scpt) and not by launchd: `it2` authenticates through an
 Apple Event to iTerm2 and the repo may live on an external volume. A launchd-spawned process has neither
@@ -10,7 +11,6 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
-import json
 import os
 import plistlib
 import re
@@ -20,10 +20,22 @@ import sys
 import time
 from pathlib import Path
 
-from . import tmconfig, tmstatusline
-from .tmcore import ASSETS, ROOT, SOURCE_CHECKOUT, VERSION, _decode, resolve_tmux
+from . import tmconfig, tmhooks, tmstatusline
+from .tmcore import (
+    ASSETS,
+    DEFAULT_REGISTRY,
+    ROOT,
+    SOURCE_CHECKOUT,
+    VERSION,
+    _decode,
+    fmt_age,
+    homebrew_keg,
+    load_registry,
+    resolve_tmux,
+    stable_path,
+)
 
-WRAPPER = ASSETS / "cc-status-tmux"
+WRAPPER = ASSETS / "kalmux-hook"
 TOOLBELT_SCRIPT = ASSETS / "it2_toolbelt.py"
 DEFAULT_HOOK_LINK = Path.home() / ".config/iterm2/cc-status"
 DEFAULT_TM_LINK = Path.home() / ".local/bin/kalmux"
@@ -69,8 +81,15 @@ MANAGED_BEGIN = "# >>> kalmux (managed block; edit via `kalmux setup`) >>>"
 MANAGED_END = "# <<< kalmux <<<"
 # every marker pair this block was ever written with; the backreference keeps begin and end paired up
 LEGACY_MANAGED_RE = re.compile(r"# >>> (kmux|tmux-manager)[^\n]*\n.*?# <<< \1 <<<\n?", re.DOTALL)
-KEY_HOOK_EVENTS = {"UserPromptSubmit", "Stop", "Notification", "PermissionRequest", "PreToolUse", "SessionEnd"}
+HOOKS_STEP = "Claude Code hooks"
+HOOKS_CHECK = "Claude Code hooks call Kalmux"
+CLI_STEP = "kalmux symlink"
+TMUX_CONF_STEP = "tmux.conf block"
 EXIT_EMPTY_CHECK = "tmux.conf exit-empty off (a killed last session stays killed)"
+# what `kalmux doctor --fix` may run on its own: idempotent, and nothing that writes iTerm2's preferences,
+# its AutoLaunch folder or its toolbelt, or starts a server (those print the command to run instead)
+SAFE_FIX_STEPS = frozenset({HOOKS_STEP, CLI_STEP, TMUX_CONF_STEP, STATUSLINE_STEP,
+                            *(f"{link.name} alias symlink (skipped if the path is not ours)" for link in LEGACY_LINKS)})
 
 
 # ----------------------------------------------------------------------------- tmux.conf block
@@ -81,7 +100,7 @@ def managed_block(tm_path: Path = DEFAULT_TM_LINK) -> str:
         "set -g allow-passthrough on",
         "# Keep the server up with no session left, so Kalmux can tell \"the last session was killed\" from \"tmux died\".",
         "set -s exit-empty off",
-        "# Show Claude Code state (written by cc-status-tmux) in the status line for normal / remote attaches.",
+        "# Show Claude Code state (written by kalmux-hook) in the status line for normal / remote attaches.",
         "set -g status-interval 5",
         "set -g window-status-format ' #I:#W#{?#{@cc_state}, [#{@cc_state}],} '",
         "set -g window-status-current-format ' #I:#W#{?#{@cc_state}, [#{@cc_state}],} '",
@@ -130,7 +149,7 @@ def cli_path() -> Path:
     """
     argv0 = Path(sys.argv[0]).absolute() if sys.argv and sys.argv[0] else None
     if argv0 is not None and argv0.name in tmstatusline.WRAPPER_NAMES and argv0.is_file():
-        return argv0                                 # kept unresolved on purpose: see the docstring
+        return stable_path(argv0)                    # kept unresolved on purpose: see the docstring
     if SOURCE_CHECKOUT:
         return SOURCE_CHECKOUT / "bin" / "kalmux"
     # the script installed next to THIS interpreter, before anything a stale PATH may still point at.
@@ -139,7 +158,7 @@ def cli_path() -> Path:
     if here.is_file():
         return here
     found = shutil.which("kalmux")
-    return Path(found).resolve() if found else here
+    return stable_path(Path(found).resolve()) if found else here
 
 
 CLI = cli_path()
@@ -160,9 +179,20 @@ def symlink(target: Path, link: Path) -> str:
 
 
 def link_is_ours(link: Path) -> bool:
-    """A symlink of ours: it points into this checkout (true for the dangling pre-rename bin/tm link too) or
-    straight at the installed `kalmux` command."""
-    return link.is_symlink() and (os.readlink(link).startswith(str(ROOT)) or os.readlink(link) == str(CLI))
+    """A symlink of ours: it points into this checkout (true for the dangling pre-rename bin/tm link too),
+    straight at the installed `kalmux` command, or into any version of the Homebrew kalmux keg (a link baked
+    by an older version names its versioned directory, which dangles once `brew cleanup` removes it)."""
+    if not link.is_symlink():
+        return False
+    target = os.readlink(link)
+    return target.startswith(str(ROOT)) or target == str(CLI) or _in_kalmux_keg(link, target)
+
+
+def _in_kalmux_keg(link: Path, target: str) -> bool:
+    candidates = [Path(target)]
+    with contextlib.suppress(OSError):
+        candidates.append(link.resolve())
+    return any((keg := homebrew_keg(c)) is not None and keg[1] == "kalmux" for c in candidates)
 
 
 def is_the_command(link: Path) -> bool:
@@ -326,7 +356,7 @@ def autolaunch_state(script: Path = AUTOLAUNCH, stamp: Path = AUTOLAUNCH_STAMP) 
 
 def install_autolaunch(tm_path: Path = DEFAULT_TM_LINK, script: Path = AUTOLAUNCH, stamp: Path = AUTOLAUNCH_STAMP,
                        python: str = "") -> None:
-    python = python or sys.executable
+    python = str(stable_path(Path(python or sys.executable)))     # a versioned python keg dies on `brew upgrade`
     if sys.version_info < (3, 11):  # noqa: UP036 - a git clone can still be run by an old `python3` (see the docstring)
         raise OSError(f"refusing to bake {python} (Python {sys.version.split()[0]}) into AutoLaunch: "
                       "kalmux needs >=3.11; run `kalmux setup` from a shell whose `python3` is modern (e.g. Homebrew's)")
@@ -412,20 +442,23 @@ def toolbelt_registered(reader=defaults_read) -> bool:
 
 
 # ----------------------------------------------------------------------------- setup / doctor
+def alias_step(link: Path) -> str:
+    return f"{link.name} alias symlink (skipped if the path is not ours)"
+
+
 def setup_steps(ui: bool = True, tm_link: Path = DEFAULT_TM_LINK, hook_link: Path = DEFAULT_HOOK_LINK,
                 statusline: bool = True, settings_path: Path = DEFAULT_SETTINGS) -> list[tuple[str, callable]]:
     steps = [
         # first: everything below (the config file, the saved status line, the pidfile) lives in the state dir
         (STATE_DIR_STEP, migrate_state_dir),
         ("config file", tmconfig.ensure_config),
-        ("hook symlink", lambda: symlink(WRAPPER, hook_link)),
-        ("kalmux symlink", lambda: symlink_cli(tm_link)),
+        (HOOKS_STEP, lambda: tmhooks.wire_claude_hooks(settings_path, WRAPPER, STATE_DIR, hook_link=hook_link)),
+        (CLI_STEP, lambda: symlink_cli(tm_link)),
     ]
-    steps += [(f"{link.name} alias symlink (skipped if the path is not ours)",
-               lambda link=link: alias_symlink(CLI, link)) for link in LEGACY_LINKS]
+    steps += [(alias_step(link), lambda link=link: alias_symlink(CLI, link)) for link in LEGACY_LINKS]
     steps += [
         ("iTerm2 prefs", write_iterm_prefs),
-        ("tmux.conf block", lambda: write_tmux_conf(DEFAULT_TMUX_CONF, tm_link)),
+        (TMUX_CONF_STEP, lambda: write_tmux_conf(DEFAULT_TMUX_CONF, tm_link)),
     ]
     if ui and sys.platform == "darwin":
         steps += [
@@ -458,18 +491,46 @@ def _register_or_raise() -> None:
         raise OSError(out or "registration failed")
 
 
-def run_setup(dry_run: bool = False, ui: bool = True, statusline: bool = True, printer=print) -> int:
+def _run_steps(steps: list[tuple[str, callable]], printer) -> int:
     failures = 0
-    for name, fn in setup_steps(ui=ui, statusline=statusline):
-        if dry_run:
-            printer(f"would: {name}")
-            continue
+    for name, fn in steps:
         try:
             note = fn()
             printer(f"✓ {name}" + (f" ({note})" if isinstance(note, str) and note else ""))
         except (OSError, ValueError) as exc:
             failures += 1
             printer(f"✗ {name}: {exc}")
+    return failures
+
+
+def run_setup(dry_run: bool = False, ui: bool = True, statusline: bool = True, printer=print) -> int:
+    steps = setup_steps(ui=ui, statusline=statusline)
+    if dry_run:
+        for name, _ in steps:
+            printer(f"would: {name}")
+        return 0
+    return _run_steps(steps, printer)
+
+
+def fix_plan(checks: list[dict]) -> list[str]:
+    """The setup steps `doctor --fix` would run for the red checks: safe, idempotent ones only, in setup order."""
+    wanted = {c["fix"] for c in checks if not c["ok"] and c.get("fix") in SAFE_FIX_STEPS}
+    order = [name for name, _ in setup_steps(ui=False)]
+    return [name for name in order if name in wanted]
+
+
+def run_fix(checks: list[dict], ui: bool = True, statusline: bool = True, printer=print) -> int:
+    """`kalmux doctor --fix`: say what will run, run only that, then list what needs a human. Returns failures.
+
+    The iTerm2 preferences, the AutoLaunch script, the ui server and the toolbelt are never touched here: each
+    red check of theirs carries the exact command to run by hand instead."""
+    plan = fix_plan(checks)
+    printer(("kalmux doctor --fix will run: " + ", ".join(plan)) if plan else "nothing kalmux doctor --fix can repair on its own")
+    steps = [(name, fn) for name, fn in setup_steps(ui=ui, statusline=statusline) if name in plan]
+    failures = _run_steps(steps, printer)
+    for c in checks:
+        if not c["ok"] and c.get("fix") not in SAFE_FIX_STEPS:
+            printer(f"by hand: {c['name']}: {c['remedy']}")
     return failures
 
 
@@ -497,104 +558,177 @@ def check_session_snapshot(sessions_file: Path = SESSIONS_FILE, tmux=None, now=N
     return verdict()
 
 
-def _hook_commands(settings_path: Path) -> dict[str, list[str]]:
-    hooks = json.loads(settings_path.read_text()).get("hooks", {})
-    return {ev: [h.get("command", "") for g in groups for h in g.get("hooks", [])] for ev, groups in hooks.items()}
+class Checks(list):
+    """The doctor's report: one dict per line, each red one with a one-line remedy (and a setup step to fix it)."""
+
+    def add(self, name: str, ok: bool, info: str = "", remedy: str = "", fix: str = "") -> None:
+        self.append({"name": name, "ok": bool(ok), "info": info, "remedy": remedy if not ok else "", "fix": fix})
+
+
+def _link_info(link: Path) -> str:
+    if link.is_symlink():
+        return f"{link} -> {os.readlink(link)}"
+    return f"{link} is not a symlink (left alone)" if link.exists() else f"{link} missing"
+
+
+def _check_paths(checks: Checks, config: dict, cli_link: Path, alias_links: tuple[Path, ...]) -> None:
+    errors = config.get("_errors") or []
+    checks.add("kalmux config file", not errors, "; ".join(errors) or str(tmconfig.config_path()),
+               f"fix the listed keys in {tmconfig.config_path()} (`kalmux config` shows the result)")
+    # the rename moved bin/kmux to bin/kalmux: a pre-rename ~/.local/bin/kmux symlink dangles until setup runs
+    checks.add("kalmux on PATH", is_the_command(cli_link), str(cli_link) if not cli_link.is_symlink() else _link_info(cli_link),
+               "kalmux doctor --fix (links the kalmux command there)", CLI_STEP)
+    for link in alias_links:
+        checks.add(f"{link.name} alias", is_the_command(link), _link_info(link),
+                   f"kalmux doctor --fix; if {link} is another program, it stays: remove it yourself to get the alias",
+                   alias_step(link))
+
+
+def _check_hooks(checks: Checks, settings_path: Path, hook_link: Path, wrapper: Path, state_dir: Path,
+                 registry: dict, version: tuple[int, ...] | None) -> None:
+    settings: dict = {}
+    try:
+        settings = tmstatusline.load_settings(settings_path)
+        problems = tmhooks.wiring_problems(settings, wrapper, tmhooks.status_mode(settings, version))
+    except (OSError, ValueError) as exc:
+        problems = [tmhooks.read_problem(settings_path, exc)]
+    checks.add(HOOKS_CHECK, not problems, "; ".join(problems) or f"{len(tmhooks.HOOK_EVENTS)} events -> {wrapper}",
+               "kalmux doctor --fix (adds Kalmux's own entries; iTerm2's stay as they are)", HOOKS_STEP)
+    _check_iterm_native(checks, settings, version)
+    checks.add("iTerm2 owns ~/.config/iterm2/cc-status", not tmhooks.points_at_kalmux(hook_link), _link_info(hook_link),
+               "kalmux doctor --fix (gives the link back to iTerm2)", HOOKS_STEP)
+    checks.add("wrapper executable", os.access(wrapper, os.X_OK), str(wrapper),
+               f"reinstall Kalmux, or chmod +x {wrapper}")
+    seen, quiet = tmhooks.silence(state_dir, registry)
+    age = tmhooks.heartbeat_age(state_dir)
+    info = "no hook event yet" if seen is None else f"last event {fmt_age(age)} ago"
+    if quiet:
+        info += "; not reporting: " + ", ".join(tmhooks.unreported(state_dir, registry))
+    if problems:        # nothing can arrive through entries that are not there: fixing them comes first
+        checks.add("hooks reach Kalmux", not quiet, info, "kalmux doctor --fix (Kalmux's entries are missing, see above)", HOOKS_STEP)
+    else:
+        checks.add("hooks reach Kalmux", not quiet, info,
+                   "restart a Claude session listed here if it still does not report (it may predate the wiring); "
+                   "if none report, kalmux doctor --fix")
+
+
+def _check_iterm_native(checks: Checks, settings: dict, version: tuple[int, ...] | None) -> None:
+    """iTerm2's own hooks run next to Kalmux's; before 3.7.5 they report every tmux pane to one hidden tab."""
+    try:
+        hooked = tmhooks.iterm2_hooked(settings)
+    except ValueError:
+        return
+    if version is None or not hooked:
+        return
+    shown = ".".join(map(str, version))
+    native = version >= tmhooks.ITERM2_NATIVE_TMUX
+    checks.add("iTerm2 3.7.5+ (reports tmux panes itself)", native,
+               f"iTerm2 {shown}" + ("" if native else ": its own Claude Code hooks report every tmux pane to one hidden tab"),
+               "upgrade iTerm2 to 3.7.5 or newer (Settings > General > Check for Updates)")
+
+
+def _check_tmux(checks: Checks, tmux_conf: Path) -> None:
+    checks.add("jq installed", bool(shutil.which("jq")), shutil.which("jq") or "", "brew install jq")
+    checks.add("tmux installed", bool(resolve_tmux()), resolve_tmux() or "", "brew install tmux")
+    try:
+        conf = tmux_conf.read_text()
+    except OSError:
+        conf = ""
+    remedy = f"kalmux doctor --fix (rewrites the managed block in {tmux_conf} and reloads it)"
+    checks.add("tmux.conf allow-passthrough", "allow-passthrough on" in conf, str(tmux_conf), remedy, TMUX_CONF_STEP)
+    # without it, killing the last session stops the server, and that is indistinguishable from a crash:
+    # the restore would bring the session the user just killed straight back
+    checks.add(EXIT_EMPTY_CHECK, "exit-empty off" in conf, str(tmux_conf), remedy, TMUX_CONF_STEP)
+    checks.add("tmux.conf client-attached hook (status replay)", "client-attached" in conf, str(tmux_conf), remedy, TMUX_CONF_STEP)
+
+
+def _check_statusline(checks: Checks, line: dict, settings_path: Path, state_dir: Path) -> None:
+    name = "statusLine routed through kalmux"
+    if not line["routed"]:
+        # no fix step: `setup --no-statusline` is recorded nowhere, and --fix must not route what the user kept
+        checks.add(name, False, "not routed; kalmux statusline install routes it (skip this check with --no-statusline)",
+                   "kalmux statusline install")
+    elif not line.get("saved_present", bool(line.get("saved_command"))):
+        # routed with no saved original: uninstall cannot put anything back and the tap prints our default
+        checks.add(name, False,
+                   f"routed, but the saved original is gone ({tmstatusline.saved_path(state_dir)}); recover it from "
+                   f"{settings_path}{tmstatusline.BACKUP_SUFFIX}, then run `kalmux statusline install` again",
+                   f"copy your statusLine back from {settings_path}{tmstatusline.BACKUP_SUFFIX}, then kalmux statusline install")
+    else:
+        checks.add(name, True, f"original saved: {line['saved_command'] or 'none'}")
+    python = line.get("interpreter") if line["routed"] else ""
+    if python:
+        # the command carries an absolute interpreter so it never depends on PATH; a removed one blanks the line
+        there = tmstatusline.usable_python(python)
+        checks.add("statusLine interpreter exists", there,
+                   python if there else f"{python} is gone or older than 3.11: run `kalmux setup` to bake the current one",
+                   "kalmux doctor --fix (bakes the interpreter running it into the statusLine command)", STATUSLINE_STEP)
+    # informational: a machine simply nobody has used in the last 10 minutes is healthy
+    checks.add("status files fresh", True,
+               f"{line['fresh']} file(s) newer than {tmstatusline.FRESH_SECONDS // 60} min in {state_dir / 'status'}"
+               " (0 is normal until a Claude session refreshes its status line)")
+
+
+def _check_iterm(checks: Checks, reader, ui: bool, autolaunch, autolaunch_paths) -> None:
+    prefs = "kalmux setup (writes this iTerm2 preference), or Settings > General > tmux"
+    checks.add("iTerm2 OpenTmuxWindowsIn=2 (tabs in attaching window)", reader("OpenTmuxWindowsIn") == "2",
+               "Settings > General > tmux", prefs)
+    checks.add("iTerm2 AutoHideTmuxClientSession=1", reader("AutoHideTmuxClientSession") == "1",
+               "Settings > General > tmux", prefs)
+    if not ui:
+        return
+    checks.add("iTerm2 toolbelt tool registered", toolbelt_registered(reader),
+               f"{TOOLBELT_ID} in NoSyncDynamicTools (kalmux ui show)", "kalmux ui show (registers the toolbelt tool)")
+    state = autolaunch() if autolaunch else autolaunch_state()
+    checks.add("iTerm2 AutoLaunch script starts the ui server", state == "ours", f"{AUTOLAUNCH}: {state} (kalmux ui install)",
+               "kalmux ui install" if state != "foreign" else f"add the line `kalmux ui install` prints to your own {AUTOLAUNCH}")
+    if state == "ours":
+        targets = autolaunch_paths() if autolaunch_paths else autolaunch_targets()
+        missing = [t for t in targets if not os.path.exists(t)]
+        checks.add("AutoLaunch script targets exist", bool(targets) and not missing,
+                   ("missing: " + ", ".join(missing) + " (kalmux ui install)") if missing else ", ".join(targets) or "could not read the script",
+                   "kalmux ui install (bakes the current interpreter and command)")
+
+
+def _check_ui(checks: Checks, h: dict | None, state_dir: Path, snapshot_status) -> None:
+    checks.add("ui server reachable", bool(h), f"{UI_URL} pid {h.get('pid')}" if h else f"{UI_URL} not answering (kalmux ui start)",
+               "kalmux ui start (from a shell inside iTerm2)")
+    if not h:
+        return
+    checks.add("ui server can run tmux", bool(h.get("tmux")),
+               h.get("tmux") or "the server's PATH has no tmux: `kalmux ui restart` from an iTerm2 shell, then `kalmux ui install`",
+               "kalmux ui restart from an iTerm2 shell, then kalmux ui install")
+    running = h.get("version") or "unknown"
+    checks.add("ui server runs this code", running == VERSION,
+               f"server {running}, checkout {VERSION}" + ("" if running == VERSION else ", kalmux ui restart (from an iTerm2 shell)"),
+               "kalmux ui restart (from an iTerm2 shell)")
+    # only while the server answers: it is the process that writes the file every 5 s; state_dir, not the
+    # module default: a doctor pointed at another state dir reads that one
+    status = snapshot_status or (lambda: check_session_snapshot(state_dir / "sessions.json"))
+    checks.add("session snapshot (restore after a crash or reboot)", *status(),
+               remedy="wait 5 s and run kalmux doctor again; if it stays red, kalmux ui restart (from an iTerm2 shell)")
 
 
 def doctor_checks(settings_path: Path = DEFAULT_SETTINGS, hook_link: Path = DEFAULT_HOOK_LINK, wrapper: Path = WRAPPER,
                   tmux_conf: Path = DEFAULT_TMUX_CONF, defaults_reader=None, ui_health=None, autolaunch=None,
                   ui: bool = True, cli_link: Path = DEFAULT_TM_LINK, alias_links: tuple[Path, ...] = LEGACY_LINKS,
                   autolaunch_paths=None, state_dir: Path = STATE_DIR, statusline_status=None,
-                  statusline: bool = True, config_loader=None, snapshot_status=None) -> list[dict]:
+                  statusline: bool = True, config_loader=None, snapshot_status=None, registry_loader=None,
+                  iterm_version=None) -> list[dict]:
     """ui=False (a machine set up with `kalmux setup --no-ui`) skips the toolbelt / AutoLaunch / server checks;
-    statusline=False (`--no-statusline`) skips the two status-line checks the same way."""
-    checks: list[dict] = []
-
-    def add(name: str, ok: bool, info: str = "") -> None:
-        checks.append({"name": name, "ok": bool(ok), "info": info})
-
-    def link_info(link: Path) -> str:
-        return f"{link} -> {os.readlink(link)}" if link.is_symlink() else (f"{link} is not a symlink (left alone)" if link.exists() else f"{link} missing")
-
-    config = (config_loader() if config_loader else tmconfig.load_config()) or {}
-    config_errors = config.get("_errors") or []
-    add("kalmux config file", not config_errors, "; ".join(config_errors) or str(tmconfig.config_path()))
-
-    # the rename moved bin/kmux to bin/kalmux: a pre-rename ~/.local/bin/kmux symlink dangles until setup runs
-    add("kalmux on PATH", is_the_command(cli_link),
-        (str(cli_link) if not cli_link.is_symlink() else link_info(cli_link)) + " (kalmux setup)")
-    for alias_link in alias_links:
-        add(f"{alias_link.name} alias", is_the_command(alias_link), link_info(alias_link))
-
-    try:
-        link_ok = hook_link.is_symlink() and hook_link.resolve() == wrapper.resolve()
-        add("hook symlink -> wrapper", link_ok, f"{hook_link} -> {os.readlink(hook_link) if hook_link.is_symlink() else 'missing'}")
-    except OSError as exc:
-        add("hook symlink -> wrapper", False, str(exc))
-    add("wrapper executable", os.access(wrapper, os.X_OK), str(wrapper))
-    try:
-        by_event = _hook_commands(settings_path)
-        uses = [c for cmds in by_event.values() for c in cmds if str(hook_link) in c or "cc-status" in c]
-        add("settings.json hooks use cc-status", bool(uses), f"{len(uses)} hook command(s) reference cc-status")
-        wired = {ev for ev, cmds in by_event.items() if any(str(hook_link) in c or "cc-status" in c for c in cmds)}
-        missing = KEY_HOOK_EVENTS - wired
-        add("key hook events wired", not missing, "missing: " + ", ".join(sorted(missing)) if missing else "all key events wired")
-    except (OSError, ValueError) as exc:
-        add("settings.json hooks use cc-status", False, str(exc))
-        add("key hook events wired", False, str(exc))
-    add("jq installed", bool(shutil.which("jq")), shutil.which("jq") or "install: brew install jq")
-    add("tmux installed", bool(resolve_tmux()), resolve_tmux() or "")
-    try:
-        conf = tmux_conf.read_text()
-    except OSError:
-        conf = ""
-    add("tmux.conf allow-passthrough", "allow-passthrough on" in conf, str(tmux_conf))
-    # without it, killing the last session stops the server, and that is indistinguishable from a crash:
-    # the restore would bring the session the user just killed straight back
-    add(EXIT_EMPTY_CHECK, "exit-empty off" in conf, str(tmux_conf))
-    add("tmux.conf client-attached hook (status replay)", "client-attached" in conf, str(tmux_conf))
+    statusline=False (`--no-statusline`) skips the two status-line checks the same way. Every red check
+    carries a one-line `remedy`; the ones `kalmux doctor --fix` can repair name their setup step in `fix`."""
+    checks = Checks()
+    _check_paths(checks, (config_loader() if config_loader else tmconfig.load_config()) or {}, cli_link, alias_links)
+    registry = registry_loader() if registry_loader else load_registry(DEFAULT_REGISTRY)
+    version = iterm_version() if iterm_version else tmhooks.iterm2_version()
+    _check_hooks(checks, settings_path, hook_link, wrapper, state_dir, registry, version)
+    _check_tmux(checks, tmux_conf)
     if statusline:
         line = statusline_status() if statusline_status else tmstatusline.status(settings_path, state_dir)
-        saved_there = line.get("saved_present", bool(line.get("saved_command")))
-        if not line["routed"]:
-            add("statusLine routed through kalmux", False, "kalmux statusline install")
-        elif not saved_there:
-            # routed with no saved original: uninstall cannot put anything back and the tap prints our default
-            add("statusLine routed through kalmux", False,
-                f"routed, but the saved original is gone ({tmstatusline.saved_path(state_dir)}); recover it from "
-                f"{settings_path}{tmstatusline.BACKUP_SUFFIX}, then run `kalmux statusline install` again")
-        else:
-            add("statusLine routed through kalmux", True, f"original saved: {line['saved_command'] or 'none'}")
-        # informational: a machine simply nobody has used in the last 10 minutes is healthy
-        add("status files fresh", True,
-            f"{line['fresh']} file(s) newer than {tmstatusline.FRESH_SECONDS // 60} min in {state_dir / 'status'}"
-            " (0 is normal until a Claude session refreshes its status line)")
-    reader = defaults_reader or defaults_read
+        _check_statusline(checks, line, settings_path, state_dir)
     if sys.platform == "darwin":
-        add("iTerm2 OpenTmuxWindowsIn=2 (tabs in attaching window)", reader("OpenTmuxWindowsIn") == "2", "Settings > General > tmux")
-        add("iTerm2 AutoHideTmuxClientSession=1", reader("AutoHideTmuxClientSession") == "1", "Settings > General > tmux")
-    if sys.platform == "darwin" and ui:
-        add("iTerm2 toolbelt tool registered", toolbelt_registered(reader), f"{TOOLBELT_ID} in NoSyncDynamicTools (kalmux ui show)")
-        state = autolaunch() if autolaunch else autolaunch_state()
-        add("iTerm2 AutoLaunch script starts the ui server", state == "ours", f"{AUTOLAUNCH}: {state} (kalmux ui install)")
-        if state == "ours":
-            targets = autolaunch_paths() if autolaunch_paths else autolaunch_targets()
-            missing = [t for t in targets if not os.path.exists(t)]
-            add("AutoLaunch script targets exist", bool(targets) and not missing,
-                ("missing: " + ", ".join(missing) + " (kalmux ui install)") if missing else ", ".join(targets) or "could not read the script")
-        if ui_health is not None:
-            h = ui_health()
-            add("ui server reachable", bool(h), f"{UI_URL} pid {h.get('pid')}" if h else f"{UI_URL} not answering (kalmux ui start)")
-            if h:
-                add("ui server can run tmux", bool(h.get("tmux")),
-                    h.get("tmux") or "the server's PATH has no tmux: `kalmux ui restart` from an iTerm2 shell, then `kalmux ui install`")
-                running = h.get("version") or "unknown"
-                add("ui server runs this code", running == VERSION,
-                    f"server {running}, checkout {VERSION}"
-                    + ("" if running == VERSION else " — kalmux ui restart (from an iTerm2 shell)"))
-                # only while the server answers: it is the process that writes the file every 5 s
-                # state_dir, not the module default: a doctor pointed at another state dir reads that one
-                status = snapshot_status or (lambda: check_session_snapshot(state_dir / "sessions.json"))
-                add("session snapshot (restore after a crash or reboot)", *status())
-    return checks
+        _check_iterm(checks, defaults_reader or defaults_read, ui, autolaunch, autolaunch_paths)
+        if ui and ui_health is not None:
+            _check_ui(checks, ui_health(), state_dir, snapshot_status)
+    return list(checks)

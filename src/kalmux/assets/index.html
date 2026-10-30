@@ -57,7 +57,7 @@ button{background:none;border:0;cursor:pointer;padding:0}
 .btn{min-height:26px;padding:3px 10px;background:var(--card);
   border:1px solid var(--bd);border-radius:6px;white-space:nowrap}
 .btn:hover:not(:disabled){border-color:var(--bd2)}
-.btn:disabled{opacity:.4;cursor:default}
+.btn:disabled,.btn[aria-disabled=true]{opacity:.4;cursor:default}
 .btn.pri{background:var(--acc);border-color:var(--acc);color:#fff}
 .btn.danger{color:var(--bad);border-color:var(--bad)}
 #gowait{flex:1 1 100%}
@@ -77,6 +77,19 @@ button{background:none;border:0;cursor:pointer;padding:0}
 .row{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
 .err{color:var(--bad);font-size:11px}
 #off{padding:4px 8px;font-size:11.5px;color:var(--gone);background:#a5564f22;border-top:1px solid var(--bd)}
+#rst{display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding:5px 8px;font-size:11.5px;
+  color:var(--fg2);background:#0a84ff1f;border-top:1px solid var(--bd)}
+#rst-msg{flex:1 1 150px;min-width:0}
+#rst .btn{min-height:22px;padding:1px 8px;font-size:11px}
+#hookbad{display:flex;flex-direction:column;gap:3px;padding:6px 8px 7px;font-size:11.5px;
+  background:#ff453a26;border-top:1px solid var(--bad)}
+#hookbad .hb-h{display:flex;align-items:center;gap:6px}
+#hookbad .hb-t{flex:1 1 auto;font-weight:600;color:var(--bad)}
+#hookbad .hb-r{overflow-wrap:anywhere;max-height:4.6em;overflow:auto}
+#hookbad .btn{align-self:flex-start;margin-top:2px;border-color:var(--bad)}
+#hookbad .hb-h .btn{margin-top:0;min-height:20px;padding:0 7px;font-size:10.5px;border-color:var(--bd2)}
+#hookbad.min .hb-body{display:none}
+.vh{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
 
 /* ===== session list ===== */
 #list{display:flex;flex-direction:column;gap:6px;padding:8px;max-width:760px;margin:0 auto}
@@ -109,6 +122,9 @@ button{background:none;border:0;cursor:pointer;padding:0}
 .bdg{display:flex;gap:4px;flex-wrap:wrap;margin-top:2px}
 .b{font-size:10px;line-height:14px;padding:0 4px;color:var(--dim);
   border:1px solid var(--bd2);border-radius:4px;white-space:nowrap}
+.b.rst{color:var(--acc);border-color:var(--acc)}
+.b.moved{color:var(--warn);border-color:var(--warn)}
+.note{font-size:11px;color:var(--warn);overflow-wrap:anywhere}
 .panes{list-style:none;display:grid;gap:2px;margin:4px 0 0;padding:0 0 0 6px;border-left:1px solid var(--bd2)}
 .panes li{display:flex;gap:5px;align-items:center;font-size:11px;min-width:0}
 .dot{flex:0 0 6px;width:6px;height:6px;border-radius:50%;background:var(--unk)}
@@ -125,6 +141,7 @@ button{background:none;border:0;cursor:pointer;padding:0}
 .gauge.hi i{background:var(--bad)}
 .ctx{font-variant-numeric:tabular-nums;flex:0 0 auto}
 .ctx.mid{color:var(--warn)} .ctx.hi{color:var(--bad)}
+.gauge.old,.ctx.old,.mdl.old{opacity:.55}
 #quota{font-variant-numeric:tabular-nums}
 #quota.mid{color:var(--warn);border-color:var(--warn)}
 #quota.hi{color:var(--bad);border-color:var(--bad)}
@@ -198,7 +215,24 @@ button{background:none;border:0;cursor:pointer;padding:0}
     </div>
     <div class="err" id="nf-err"></div>
   </div>
+  <div id="rst" hidden role="status">
+    <span id="rst-msg"></span>
+    <button class="btn pri" type="button" id="rst-open" title="Open a tab for every restored session, in the current iTerm2 window">Open all</button>
+    <button class="btn" type="button" id="rst-no" title="Keep the sessions, stop asking to open them">Dismiss</button>
+  </div>
   <div id="off" hidden></div>
+  <div id="hookbad" role="status" hidden>
+    <div class="hb-h">
+      <span class="hb-t">Claude Code's hooks are not reaching Kalmux</span>
+      <button class="btn" type="button" id="hookmin" aria-expanded="true" aria-controls="hookbad-body">Hide</button>
+    </div>
+    <div class="hb-body" id="hookbad-body">
+      <div>States, the Gone list and alerts are out of date until this is fixed.</div>
+      <div class="hb-r dim" id="hookbad-why"></div>
+      <div class="hb-r" id="hookbad-res" hidden></div>
+      <button class="btn" type="button" id="hookfix" title="Re-write Kalmux's own hook entries in ~/.claude/settings.json (nothing else)">Repair</button>
+    </div>
+  </div>
 </header>
 
 <main id="list"></main>
@@ -220,6 +254,7 @@ button{background:none;border:0;cursor:pointer;padding:0}
       <div class="det clip"></div>
       <div class="ttl"></div>
       <div class="bdg"></div>
+      <div class="note" hidden></div>
       <ul class="panes"></ul>
     </div>
     <div class="acts">
@@ -254,11 +289,13 @@ function fmtAge(a){
 }
 const num = v => (typeof v === 'number' && isFinite(v)) ? v : null;
 const clampPct = p => Math.max(0, Math.min(100, p));
+const OLD_STATUS = 3600;   // a gauge older than this is dimmed (matches the server's STATUS_FRESH)
 function ctxTip(s){
   // clamped like the bar: a server that reports 118% must not put 'context 118%' in the tooltip
-  const raw = num(s.ctx_pct), pct = raw === null ? null : clampPct(raw), cost = num(s.cost_usd);
+  const raw = num(s.ctx_pct), pct = raw === null ? null : clampPct(raw), cost = num(s.cost_usd), age = num(s.status_age);
   return [pct === null ? '' : 'context ' + Math.round(pct) + '%', s.model || '',
-          cost === null ? '' : '$' + cost.toFixed(2)].filter(Boolean).join(' · ');
+          cost === null ? '' : '$' + cost.toFixed(2),
+          age === null || age < 60 ? '' : 'as of ' + fmtAge(age) + ' ago'].filter(Boolean).join(' · ');
 }
 function shortPath(p){
   if (!p) return '';
@@ -354,7 +391,13 @@ function pass(s){
 
 /* ========== session cards ========== */
 const cards = new Map();
-function mark(ch, tip){ const s = el('span', null, ch); s.title = tip; return s; }
+function mark(ch, tip){
+  // the glyph is for the eye; screen readers get the words (title alone is not announced reliably)
+  const s = el('span', null);
+  const g = el('span', null, ch); g.setAttribute('aria-hidden', 'true'); g.title = tip;
+  s.append(g, el('span', 'vh', tip));
+  return s;
+}
 
 function updCard(c, s){
   c.dataset.name = s.name;
@@ -373,9 +416,9 @@ function updCard(c, s){
 
   const mk = c.querySelector('.mk'); mk.replaceChildren();
   if (s.source === 'registry') mk.appendChild(mark('~', 'last known value from the registry, not from a hook'));
-  if (s.stale) mk.appendChild(mark('?', 'working or waiting for an unusually long time (over 30 minutes)'));
+  if (s.overdue) mk.appendChild(mark('?', 'working or waiting with no sign of life for over 30 minutes (no status line update or transcript write)'));
 
-  const pct = num(s.ctx_pct), tip = ctxTip(s);
+  const pct = num(s.ctx_pct), tip = ctxTip(s), age = num(s.status_age), old = age !== null && age > OLD_STATUS;
   const g = c.querySelector('.gauge'), ctx = c.querySelector('.ctx');
   g.hidden = ctx.hidden = pct === null;
   if (pct !== null) {
@@ -383,12 +426,13 @@ function updCard(c, s){
     g.querySelector('i').style.width = p + '%';
     g.classList.toggle('mid', p >= 60 && p < 85);
     g.classList.toggle('hi', p >= 85);
-    ctx.className = 'ctx' + (p >= 85 ? ' hi' : p >= 60 ? ' mid' : '');
+    g.classList.toggle('old', old);
+    ctx.className = 'ctx' + (p >= 85 ? ' hi' : p >= 60 ? ' mid' : '') + (old ? ' old' : '');
     setTxt(ctx, Math.round(p) + '%');
     g.title = ctx.title = tip;
   }
   const mdl = c.querySelector('.mdl');
-  setTxt(mdl, s.model || ''); mdl.hidden = !s.model; mdl.title = tip;
+  setTxt(mdl, s.model || ''); mdl.hidden = !s.model; mdl.title = tip; mdl.classList.toggle('old', old);
 
   const r2 = c.querySelector('.r2');
   setTxt(c.querySelector('.proj'), s.project || '');
@@ -407,6 +451,22 @@ function updCard(c, s){
   if (s.in_iterm2) bdg.appendChild(el('span', 'b', 'tab'));
   else if (s.attached > 0) bdg.appendChild(el('span', 'b', s.attached === 1 ? 'ssh' : s.attached + ' clients'));
   if (!s.attached) bdg.appendChild(el('span', 'b', 'detached'));
+  if (s.restored) {
+    const b = el('span', 'b rst', 'restored');
+    b.title = 'Recreated by a restore' + (num(s.restored_at) === null ? '' : ' at ' + hhmm(s.restored_at)) +
+              ' and not opened yet: click the card to open its tab';
+    b.setAttribute('aria-label', b.title);
+    bdg.appendChild(b);
+  }
+  if (s.cwd_fallback) {
+    const b = el('span', 'b moved', 'folder missing');
+    b.title = s.cwd_fallback + ' was not there at restore time: the session started in ~ and keeps that folder for the next restore';
+    bdg.appendChild(b);
+  }
+  // the missing folder as text, not only a hover tooltip: touch and keyboard users need it too
+  const note = c.querySelector('.note');
+  setTxt(note, s.cwd_fallback ? 'started in ~: ' + s.cwd_fallback + ' is not there yet' : '');
+  note.hidden = !s.cwd_fallback;
 
   const ul = c.querySelector('.panes'); ul.replaceChildren();
   const ps = (s.panes || []).filter(p => p.claude || p.state);
@@ -444,6 +504,8 @@ function render(){
   }
   if (sv.version) $('#brand').title = 'Kalmux v' + sv.version;
   renderQuota(data.quota);
+  renderRestored(data.restored);
+  renderHook(data.hook);
 
   const gw = $('#gowait');
   gw.disabled = !(c.waiting > 0);
@@ -470,6 +532,50 @@ function render(){
   renderGone(data.tombstones || []);
 }
 
+/* ========== hook health banner ========== */
+// Busy buttons get aria-disabled, never `disabled`: disabling the focused button drops keyboard focus
+// to <body>. A banner that hides with focus inside hands it to the search box.
+const busy = b => b.getAttribute('aria-disabled') === 'true';
+function setBusy(b, on){ b.setAttribute('aria-disabled', on ? 'true' : 'false'); }
+function hideBanner(box, hide){
+  if (hide && !box.hidden && box.contains(document.activeElement)) $('#q').focus();
+  box.hidden = hide;
+}
+// whole minutes: the banner is a live region, and a per-second age would be re-announced on every poll
+const minutesAgo = a => a < 60 ? 'under a minute' : fmtAge(a);
+let hookSig = '';
+function renderHook(h){
+  const bad = !!h && h.ok === false, box = $('#hookbad');
+  hideBanner(box, !bad);
+  if (!bad) { hookSig = ''; $('#hookbad-res').hidden = true; return; }
+  const seen = num(h.last_seen), now = num(data.now);
+  const when = seen === null ? 'No hook event has ever reached Kalmux.'
+    : 'Last hook event ' + minutesAgo(now === null ? 0 : now - seen) + ' ago.';
+  setTxt($('#hookbad-why'), [h.reason || '', when].filter(Boolean).join(' '));
+  if ((h.reason || '') !== hookSig) {                  // a new problem: show it, drop an outdated Repair result
+    if (hookSig) $('#hookbad-res').hidden = true;
+    hookSig = h.reason || '';
+    setHookMin(false);
+  }
+}
+function setHookMin(min){
+  $('#hookbad').classList.toggle('min', min);
+  const t = $('#hookmin');
+  t.setAttribute('aria-expanded', String(!min));
+  setTxt(t, min ? 'Details' : 'Hide');
+}
+$('#hookmin').addEventListener('click', () => setHookMin(!$('#hookbad').classList.contains('min')));
+$('#hookfix').addEventListener('click', async () => {
+  const b = $('#hookfix');
+  if (busy(b)) return;
+  setBusy(b, true);
+  try {
+    const j = await act('/api/repair-hooks', {});
+    // kept in the banner (a toast is gone in 2.5 s): what Repair did, and what it could not do
+    if (j) { const r = $('#hookbad-res'); setTxt(r, j.message || ''); r.hidden = !j.message; }
+  } finally { setBusy(b, false); }
+});
+
 /* ========== quota chip ========== */
 // "resets in 3h 50m" beats a bare time of day: the toolbelt is read at a glance, and a 7d window
 // resets on another date entirely. Relative to data.now, so it matches the ages on the cards.
@@ -495,6 +601,35 @@ function renderQuota(q){
   chip.className = 'b' + (pct >= 85 ? ' hi' : pct >= 60 ? ' mid' : '');
   chip.title = [windowTip(five, '5h'), windowTip(q.seven_day, '7d')].filter(Boolean).join(' · ');
 }
+
+/* ========== restored sessions banner ========== */
+// A restore recreates the sessions without opening tabs ([restore] open_tabs = false): they wait here,
+// with a badge on each card, until they are opened (a card click, Open all) or dismissed.
+function hhmm(ts){
+  const d = new Date(ts * 1000);
+  return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+}
+let wasOpening = false;
+function openFailed(op){ return op.failed + ' of ' + op.total + ' could not be opened (see ui.log)'; }
+function renderRestored(r){
+  r = r || {};
+  const op = r.opening || {}, n = r.count || 0, box = $('#rst');
+  if (wasOpening && !op.running && op.failed > 0) toast('Open all: ' + openFailed(op), 1);
+  wasOpening = !!op.running;
+  hideBanner(box, !(n > 0 || op.running));
+  if (box.hidden) return;
+  let msg;
+  if (op.running) msg = 'Opening restored sessions… ' + ((op.done || 0) + (op.failed || 0)) + '/' + (op.total || 0);
+  else msg = n + (n === 1 ? ' session' : ' sessions') + ' restored' +
+             (num(r.at) === null ? '' : ' at ' + hhmm(r.at)) + ', not opened yet';
+  if (!op.running && op.failed > 0) msg += ' · ' + openFailed(op);   // kept until the next Open all
+  if (!op.running && r.fallbacks > 0) msg += ' · ' + r.fallbacks + ' started in ~ (folder missing)';
+  setTxt($('#rst-msg'), msg);
+  setBusy($('#rst-open'), !!op.running);
+  setBusy($('#rst-no'), !!op.running);
+}
+$('#rst-open').addEventListener('click', e => { if (!busy(e.currentTarget)) act('/api/open-restored', {}); });
+$('#rst-no').addEventListener('click', e => { if (!busy(e.currentTarget)) act('/api/dismiss-restored', {}); });
 
 /* ========== gone (tombstones) ========== */
 let goneOpen = false, goneSig = '', goneConfirm = '', goneFocus = '';

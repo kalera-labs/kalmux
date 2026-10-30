@@ -3,9 +3,67 @@
 
 `kalmux setup` points ~/.local/bin/kalmux at this file. Installing the package instead (uv, pipx,
 Homebrew) gives you the same command without it.
+
+Kalmux needs Python 3.11+, but `#!/usr/bin/env python3` follows whatever PATH the caller has: over `ssh host cmd`,
+from cron or from an iTerm2 AutoLaunch that is macOS's own 3.9. So this file stays parseable on old Pythons and,
+when it finds itself on one, re-runs the same command under a newer interpreter (or says so in one line).
 """
+import os
 import sys
-from pathlib import Path
+
+MIN_PYTHON = (3, 11)
+VERSIONS = ("3.14", "3.13", "3.12", "3.11")
+WELL_KNOWN = ("/opt/homebrew/bin", "/usr/local/bin", "/Library/Frameworks/Python.framework/Versions/{v}/bin")
+GUARD = "KALMUX_REEXEC"                    # set on the child, so a mislabelled interpreter cannot loop us
+
+
+def modern_pythons(env, home, well_known=WELL_KNOWN):
+    """Interpreters worth trying, newest first: the one KALMUX_PYTHON names, else well-known installs and PATH."""
+    named = env.get("KALMUX_PYTHON")
+    if named:
+        yield named
+        return
+    import glob
+    path = [d for d in env.get("PATH", "").split(os.pathsep) if os.path.isabs(d)]
+    seen = set()
+    for v in VERSIONS:
+        dirs = [d.format(v=v) for d in well_known] + [os.path.join(home, ".local", "bin")] + path
+        found = [os.path.join(d, "python" + v) for d in dirs]
+        found += sorted(glob.glob(os.path.join(home, ".local", "share", "uv", "python", "cpython-" + v + ".*", "bin", "python" + v)))
+        for candidate in found:
+            if candidate not in seen and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                seen.add(candidate)
+                yield candidate
+
+
+def hand_over(env, argv, execv, version, home=None, well_known=WELL_KNOWN):
+    """Re-run `argv` under a Python new enough for Kalmux, or exit with one clear error."""
+    have = ".".join(str(p) for p in version[:3])
+    if env.get(GUARD):
+        sys.exit("kalmux: needs Python %d.%d or newer, but %s is Python %s (check KALMUX_PYTHON)"
+                 % (MIN_PYTHON + (sys.executable, have)))
+    home = os.path.expanduser("~") if home is None else home
+    script = os.path.abspath(argv[0])      # NOT resolved: a symlink named kalmux is what setup records
+    candidates = list(modern_pythons(env, home, well_known))
+    named = env.get("KALMUX_PYTHON")
+    if named and not (os.path.isfile(named) and os.access(named, os.X_OK)):
+        sys.exit("kalmux: KALMUX_PYTHON=%s is not an executable file" % named)
+    env[GUARD] = "1"
+    for python in candidates:
+        try:
+            execv(python, [python, script] + list(argv[1:]))
+            return
+        except OSError:
+            continue
+    sys.exit("kalmux: needs Python %d.%d or newer, but this python3 is %s and no newer interpreter was found. "
+             "Install one (brew install python@3.13) or set KALMUX_PYTHON=/path/to/python3.13." % (MIN_PYTHON + (have,)))
+
+
+if sys.version_info < MIN_PYTHON:
+    hand_over(os.environ, sys.argv, os.execv, sys.version_info)
+os.environ.pop(GUARD, None)                # made it: children that start under an old python3 may hand over again
+
+from pathlib import Path  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 

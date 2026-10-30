@@ -1,7 +1,7 @@
 """tmcore — shared core for Kalmux (the `kalmux` CLI and the `kalmux ui` server).
 
 State comes from two first-party sources, never from screen scraping:
-  * tmux pane user options written by the cc-status-tmux hook (@cc_state, @cc_detail, @cc_since)
+  * tmux pane user options written by the kalmux-hook wrapper (@cc_state, @cc_detail, @cc_since)
   * Claude Code's live registry ~/.claude/sessions/<pid>.json (field `tmux`, `status`)
 iTerm2 is driven through its bundled `it2` CLI; tab identity comes from iTerm2's own
 `tmuxWindowPane` session variable, so a tmux pane maps to exactly one iTerm2 tab.
@@ -35,27 +35,73 @@ CLEAR_WORDS = {"none", "clear", "default", "off", ""}
 STATE_ORDER = {"waiting": 0, "working": 1, "unknown": 2, "idle": 3, "stale": 4, "gone": 5, "busy": 6, "": 7}
 ANSI = {"waiting": "\033[1;34m", "working": "\033[1;33m", "idle": "\033[32m", "unknown": "\033[2m",
         "busy": "\033[36m", "stale": "\033[2m", "gone": "\033[2;31m", "reset": "\033[0m"}
-STALE_AFTER = 30 * 60          # a working/waiting state older than this is flagged with "?"
-STATUS_FRESH = 60 * 60         # a status-line record older than this is a dead session's leftover: ignored
+# Claude's registry status (~/.claude/sessions/<pid>.json) -> card state; "shell" = idle with a background shell running
+REGISTRY_STATES = {"busy": "working", "waiting": "waiting", "idle": "idle", "shell": "idle"}
+OVERDUE_AFTER = 30 * 60        # a working/waiting session silent for this long is flagged with "?" (see liveness_age)
+STATUS_FRESH = 60 * 60         # a status-line record older than this is ignored for a session the registry lost track of
 MAX_STATUS_BYTES = 64 * 1024   # one status file is a few hundred bytes; anything bigger is not ours
 DAY = 24 * 60 * 60
 # SessionEnd reasons: a conversation that was cleared or resumed lives on elsewhere, so its trail is not a death
 END_SUPERSEDED = {"clear", "resume"}
 SEP = "\x1f"                   # field separator for tmux -F output (never appears in tmux data)
+# Session options a restore leaves on what it recreated: when (until the session is opened, attached or
+# dismissed), and the directory the session belongs in while it waits in $HOME for that one to come back.
+RESTORED_OPTION = "@kalmux_restored"
+INTENDED_OPTION = "@kalmux_cwd"
 FIELDS = ["session", "window_id", "pane_id", "cc_state", "cc_detail", "cc_since", "title", "path", "cmd", "tm_color",
-          "attached", "window_active", "pane_active", "tty", "start_cmd", "shell", "dead"]
+          "attached", "window_active", "pane_active", "tty", "start_cmd", "shell", "dead", "restored", "intended"]
 TMUX_FMT = SEP.join([
     "#{session_name}", "#{window_id}", "#{pane_id}", "#{@cc_state}", "#{@cc_detail}", "#{@cc_since}",
     "#{pane_title}", "#{pane_current_path}", "#{pane_current_command}", "#{@tm_color}", "#{session_attached}",
     "#{window_active}", "#{pane_active}", "#{pane_tty}", "#{pane_start_command}", "#{default-shell}", "#{pane_dead}",
+    "#{" + RESTORED_OPTION + "}", "#{" + INTENDED_OPTION + "}",
 ])
 assert len(FIELDS) == len(TMUX_FMT.split(SEP)), "FIELDS and TMUX_FMT must stay in lockstep (parse_panes drops every record otherwise)"
 IT2_BUNDLED = "/Applications/iTerm.app/Contents/Resources/utilities/it2"
-PKG_DIR = Path(__file__).resolve().parent              # where the modules live (a clone or site-packages)
-ASSETS = PKG_DIR / "assets"                            # cc-status-tmux, index.html, it2_toolbelt.py
-_checkout = PKG_DIR.parent.parent
-# Running straight from a git clone (bin/kalmux, or an editable install) rather than from an installed wheel.
-SOURCE_CHECKOUT = _checkout if (_checkout / "pyproject.toml").is_file() and (_checkout / "bin" / "kalmux").is_file() else None
+
+
+# ----------------------------------------------------------------------------- where Kalmux is installed
+def homebrew_keg(path: Path) -> tuple[Path, str, Path] | None:
+    """(prefix, formula, path inside the keg) when `path` lies in <prefix>/Cellar/<formula>/<version>/..., else None."""
+    parts = Path(path).parts
+    if "Cellar" not in parts:
+        return None
+    i = parts.index("Cellar")
+    if len(parts) < i + 3:
+        return None
+    return Path(*parts[:i]), parts[i + 1], Path(*parts[i + 3:])
+
+
+def stable_path(path: Path) -> Path:
+    """The form of `path` that survives `brew upgrade`: <prefix>/opt/<formula>/... instead of the versioned
+    Cellar directory an upgrade replaces and a cleanup deletes. Any other path comes back unchanged."""
+    keg = homebrew_keg(path)
+    if keg is None:
+        return Path(path)
+    prefix, formula, inside = keg
+    candidate = prefix / "opt" / formula / inside
+    return candidate if candidate.exists() else Path(path)
+
+
+def package_dir(module_file: str | Path) -> Path:
+    """Where the modules live (a clone, site-packages or a Homebrew keg), in its upgrade-proof form."""
+    return stable_path(Path(module_file).resolve().parent)
+
+
+def source_checkout(pkg_dir: Path) -> Path | None:
+    """The git clone the modules run from (bin/kalmux, or an editable install), or None for an installed copy.
+
+    A Homebrew keg carries pyproject.toml and bin/kalmux too (the formula installs the whole tree into
+    libexec), so the file test alone called it a checkout and linked things into the versioned keg."""
+    checkout = Path(pkg_dir).parent.parent
+    if not ((checkout / "pyproject.toml").is_file() and (checkout / "bin" / "kalmux").is_file()):
+        return None
+    return None if homebrew_keg(checkout.resolve()) else checkout
+
+
+PKG_DIR = package_dir(__file__)
+ASSETS = PKG_DIR / "assets"                            # kalmux-hook, index.html, it2_toolbelt.py
+SOURCE_CHECKOUT = source_checkout(PKG_DIR)
 ROOT = SOURCE_CHECKOUT or PKG_DIR                      # a symlink pointing inside this is one of ours
 DEFAULT_REGISTRY = Path.home() / ".claude/sessions"
 SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}$")
@@ -240,7 +286,10 @@ class Tmux:
         return ""
 
     def show_session_option(self, session: str, name: str) -> str:
-        return self.run("show", "-t", "=" + session, "-qv", name).strip()
+        # By id, like set_session_option: `show -t =name -qv @option` answers nothing at all on tmux 3.7c
+        # (seen in tests/test_restore_e2e.py), so a mark read that way always looked unset.
+        target = self.session_id(session)
+        return self.run("show", "-t", target, "-qv", name).strip() if target else ""
 
     def set_session_option(self, session: str, name: str, value: str | None) -> bool:
         # By id, not by "=name": set-option is the one command that does not honour the exact-match prefix
@@ -442,7 +491,7 @@ def load_registry(directory: Path, alive=pid_alive) -> dict:
         ts = d.get("statusUpdatedAt")
         entry = {
             "pid": pid, "sessionId": str(d.get("sessionId", "")), "name": str(d.get("name", "")), "cwd": str(d.get("cwd", "")),
-            "status": str(d.get("status", "")), "statusUpdatedAt": ts if isinstance(ts, (int, float)) else None,
+            "status": str(d.get("status", "")), "waitingFor": str(d.get("waitingFor") or ""), "statusUpdatedAt": ts if isinstance(ts, (int, float)) else None,
             "alive": bool(alive(pid)) if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 else False,
         }
         if key not in out or _better(entry, out[key]):
@@ -487,25 +536,61 @@ def _window(raw) -> dict | None:
     return None if pct is None and at is None else {"used_pct": pct, "resets_at": at}
 
 
-def _quota(raw) -> dict | None:
-    """rate_limits as the UI reads it: {window: {used_pct, resets_at}}, or None when there is nothing usable."""
+def _quota(raw, now: int) -> dict | None:
+    """rate_limits as the UI reads it: {window: {used_pct, resets_at}}, or None when there is nothing usable.
+    A window whose reset time has passed says nothing about the window running now, so it is dropped."""
     if not isinstance(raw, dict):
         return None
-    clean = {k: w for k, w in ((k, _window(v)) for k, v in raw.items() if isinstance(k, str)) if w}
+    clean = {k: w for k, w in ((k, _window(v)) for k, v in raw.items() if isinstance(k, str))
+             if w and (w["resets_at"] is None or w["resets_at"] > now)}
     return clean or None
 
 
-def status_fields(record, now: int) -> dict:
-    """ctx_pct / model / cost_usd / quota / status_age for one merged row (blank when there is no fresh record)."""
+def status_fields(record, now: int, alive: bool = False) -> dict:
+    """ctx_pct / model / cost_usd / quota / status_age for one merged row.
+
+    A record older than STATUS_FRESH is only trusted while the registry says the session is alive (an idle
+    session that is still there keeps its context and cost); otherwise it is a dead session's leftover. Its
+    quota goes either way: the account's windows move on whether or not this session is looking."""
     blank = {"ctx_pct": None, "model": "", "cost_usd": None, "quota": None, "status_age": None}
     ts = _number(record.get("ts")) if isinstance(record, dict) else None
-    if ts is None or now - ts > STATUS_FRESH:
+    old = ts is not None and now - ts > STATUS_FRESH
+    if ts is None or (old and not alive):
         return blank                                   # no record, or the leftover of a session that died
     pct = _number(record.get("context_pct"))
     return {"ctx_pct": max(0, min(100, int(pct))) if pct is not None else None,
             "model": record.get("model") if isinstance(record.get("model"), str) else "",
-            "cost_usd": _number(record.get("cost_usd")), "quota": _quota(record.get("rate_limits")),
+            "cost_usd": _number(record.get("cost_usd")),
+            "quota": None if old else _quota(record.get("rate_limits"), now),
             "status_age": max(0, int(now - ts))}
+
+
+def transcript_mtime(record) -> float | None:
+    """Modification time of the transcript a status-line record points at, or None (missing, unreadable, no path)."""
+    path = record.get("transcript_path") if isinstance(record, dict) else None
+    if not isinstance(path, str) or not path:
+        return None
+    try:
+        return os.stat(path).st_mtime
+    except (OSError, ValueError):
+        return None
+
+
+def liveness_age(now: int, since: int | None, record, mtime=transcript_mtime) -> int | None:
+    """Seconds since this session last showed a sign of life, or None when nothing is known.
+
+    The registry only rewrites its status on a transition, so `since` is time in state: a long turn or a
+    background workflow looks idle there. The newest of the transition, the status-line tick and the transcript
+    write is the real signal. The transcript is stat'ed only when the cheaper signals do not already clear it."""
+    ts = _number(record.get("ts")) if isinstance(record, dict) else None
+    stamps = [t for t in (since, ts) if t is not None]
+    last = max(stamps) if stamps else None
+    if last is not None and now - last <= OVERDUE_AFTER:
+        return max(0, int(now - last))
+    seen = mtime(record) if isinstance(record, dict) else None
+    if seen is not None:
+        last = max(seen, last) if last is not None else seen
+    return None if last is None else max(0, int(now - last))
 
 
 # ----------------------------------------------------------------------------- merge / render
@@ -513,7 +598,7 @@ def looks_like_claude(cmd: str) -> bool:
     return "claude" in cmd or bool(VERSION_RE.match(cmd))
 
 
-def merge(panes: list[dict], registry: dict, now: int, status: dict | None = None) -> list[dict]:
+def merge(panes: list[dict], registry: dict, now: int, status: dict | None = None, mtime=transcript_mtime) -> list[dict]:
     status = status or {}
     rows = []
     for p in panes:
@@ -531,7 +616,12 @@ def merge(panes: list[dict], registry: dict, now: int, status: dict | None = Non
         elif hook_state:
             state, source = hook_state, "hook"
         elif reg:
-            state, source = {"busy": "working", "idle": "idle"}.get(reg.get("status", ""), "unknown"), "registry"
+            reg_status = reg.get("status", "")
+            state, source = REGISTRY_STATES.get(reg_status, "unknown"), "registry"
+            if state == "waiting":
+                detail = reg.get("waitingFor") or detail      # "permission prompt", "input needed", "dialog open"
+            elif reg_status == "shell":
+                detail = "background shell"                   # idle prompt, a background shell task still runs
             ts = reg.get("statusUpdatedAt")
             since = int(ts / 1000) if ts else None
         elif claude:
@@ -541,12 +631,14 @@ def merge(panes: list[dict], registry: dict, now: int, status: dict | None = Non
         age = (now - since) if since is not None else None
         path = p.get("path", "")
         session_id = reg.get("sessionId", "") if reg else ""
+        record = status.get(session_id)
+        silent = liveness_age(now, since, record, mtime) if state in ("working", "waiting") else None
         rows.append({
-            **status_fields(status.get(session_id), now),
+            **status_fields(record, now, alive=bool(reg and reg.get("alive"))),
             "session": p["session"], "pane": f"{p['window_id']}.{p['pane_id']}", "window_id": p["window_id"], "pane_id": p["pane_id"],
             "project": os.path.basename(path.rstrip("/")) or path,
             "path": path, "claude": claude, "state": state, "detail": detail, "source": source, "age": age,
-            "stale": state in ("working", "waiting") and age is not None and age > STALE_AFTER,
+            "overdue": silent is not None and silent > OVERDUE_AFTER,
             "title": p.get("title", ""), "color": p.get("tm_color", "") if HEX_RE.match(p.get("tm_color", "")) else "",
             "claude_session_id": session_id, "claude_name": reg.get("name", "") if reg else "",
             "attached": p.get("attached", ""), "active": p.get("window_active", "") == "1" and p.get("pane_active", "") == "1",
@@ -574,8 +666,8 @@ def state_label(r: dict) -> str:
     label = r["state"] or ("-" if not r["claude"] else "?")
     if r.get("source") == "registry" and r["state"] not in ("gone", ""):
         label += "~"      # last known value from Claude's registry, not a live hook event
-    if r.get("stale"):
-        label += "?"      # working/waiting for suspiciously long: probably needs a look
+    if r.get("overdue"):
+        label += "?"      # working/waiting but silent for suspiciously long: probably needs a look
     return label
 
 
@@ -660,11 +752,13 @@ def parse_trail(session_id: str, text: str) -> dict | None:
     return trail if seen else None
 
 
-def load_trails(trace_dir: Path, now: int, keep_days: int = 30) -> list[dict]:
+def load_trails(trace_dir: Path, now: int, keep_days: int = 30, prune: bool = True) -> list[dict]:
     """Every trail in ${STATE}/trace, NEWEST FIRST: by last_ts, then by file mtime for trails with no timestamp.
 
     The order is part of the contract: `find_trail` picks the first match, so a name reused by several
-    conversations resolves to the most recent one. Files older than keep_days are pruned (trails are ours)."""
+    conversations resolves to the most recent one. Files older than keep_days are pruned (trails are ours),
+    unless prune=False: while the hook is not reaching Kalmux no new trail is written, and pruning would
+    delete the last record of the sessions that are still worth resuming."""
     found: list[tuple[int, float, dict]] = []
     trace_dir = Path(trace_dir)
     if not trace_dir.is_dir():
@@ -673,7 +767,7 @@ def load_trails(trace_dir: Path, now: int, keep_days: int = 30) -> list[dict]:
     for f in sorted(trace_dir.glob("*.jsonl")):
         try:
             mtime = f.stat().st_mtime
-            if mtime < cutoff:
+            if prune and mtime < cutoff:
                 f.unlink()
                 continue
             text = f.read_text(encoding="utf-8", errors="replace")
@@ -711,9 +805,9 @@ def tombstones(trails: list[dict], registry: dict) -> list[dict]:
     return out
 
 
-def resumable_trails(trace_dir: Path, registry: dict, now: int, keep_days: int = 30) -> list[dict]:
+def resumable_trails(trace_dir: Path, registry: dict, now: int, keep_days: int = 30, prune: bool = True) -> list[dict]:
     """The only list a resume may choose from: tombstones, so a LIVE conversation can never be a candidate."""
-    return tombstones(load_trails(trace_dir, now, keep_days), registry)
+    return tombstones(load_trails(trace_dir, now, keep_days, prune), registry)
 
 
 # ----------------------------------------------------------------------------- attach helpers

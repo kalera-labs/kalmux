@@ -1,7 +1,7 @@
 """kalmux — the command line: one `cmd_*` function per subcommand, plus the argument parser.
 
 Works at the desk (iTerm2 control mode, toolbelt web UI) and over SSH (no iTerm2 needed for `ls`).
-State comes from tmux pane options written by the cc-status-tmux hook and from Claude Code's
+State comes from tmux pane options written by the kalmux-hook wrapper and from Claude Code's
 registry; iTerm2 is driven through its bundled `it2` CLI.
 """
 from __future__ import annotations
@@ -15,7 +15,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import tmconfig, tmrestore, tmsetup, tmstatusline
+from . import tmconfig, tmhooks, tmrestore, tmsetup, tmstatusline
 from .tmactions import (
     TabMap,
     action_color,
@@ -66,6 +66,7 @@ from .tmsetup import (
     WRAPPER,
     doctor_checks,
 )
+from .tmsnapshot import pending_restored
 
 PIDFILE = STATE_DIR / "ui.pid"
 # written by a server started before a rename, in a state dir `kalmux setup` has not migrated yet
@@ -140,6 +141,35 @@ def cmd_open(tmux: Tmux, it2: It2, session: str, window: str = "", wait: float =
     return _report(r)
 
 
+def cmd_open_restored(tmux: Tmux, it2: It2, window: str = "", wait: float = 2.0) -> int:
+    """`kalmux open --restored`: one tab, in one window, for every session a restore recreated and nobody
+    has opened yet (the toolbelt's "Open all"). Each tab that opens clears its session's mark."""
+    names = list(pending_restored(tmux.list_panes()))
+    if not names:
+        print("kalmux open: no restored session is waiting for a tab")
+        return 0
+    if not it2.available():
+        print("kalmux open: iTerm2 (it2) not available here", file=sys.stderr)
+        return 1
+    failed: list[str] = []
+    clear = tmrestore.clearing(tmux)
+
+    def on_tab(name: str, ok: bool) -> None:
+        clear(name, ok)
+        if not ok:
+            failed.append(name)
+
+    opened = tmrestore.open_tabs(it2, names, socket=getattr(tmux, "socket", ""), log=print, window=window,
+                                 on_tab=on_tab, claim=tmrestore.still_pending(tmux))
+    if opened:
+        time.sleep(wait)          # as for one tab: the panes need a moment before the colors can be replayed
+        reapply(tmux)
+    elsewhere = len(names) - opened - len(failed)
+    print(f"kalmux open: {opened} of {len(names)} restored session(s) opened"
+          + (f" ({elsewhere} opened or dismissed elsewhere meanwhile)" if elsewhere else ""))
+    return 1 if failed else 0
+
+
 # ----------------------------------------------------------------------------- gone sessions
 def _dead_line(r: dict) -> str:
     """One tombstone as a line: alpha  killed  12m  my-proj  ✳ last message  (id prefix)"""
@@ -149,10 +179,15 @@ def _dead_line(r: dict) -> str:
     return "  ".join(cells).rstrip()
 
 
+def _hooks_healthy(registry: dict) -> bool:
+    """Trails may be pruned only while hooks reach Kalmux: otherwise nothing replaces what a prune deletes."""
+    return bool(tmhooks.hook_health(DEFAULT_SETTINGS, WRAPPER, STATE_DIR, registry)["ok"])
+
+
 def cmd_dead(trace_dir, registry: dict, show_all: bool = False, json_out: bool = False,
-             now: int | None = None, keep_days: int = 30) -> int:
+             now: int | None = None, keep_days: int = 30, prune: bool = True) -> int:
     now = int(time.time()) if now is None else now
-    rows = tombstones(load_trails(Path(trace_dir), now, keep_days), registry)
+    rows = tombstones(load_trails(Path(trace_dir), now, keep_days, prune), registry)
     if not show_all:
         rows = [r for r in rows if r["ended"] != "superseded"]
     if json_out:
@@ -168,12 +203,12 @@ def cmd_dead(trace_dir, registry: dict, show_all: bool = False, json_out: bool =
 
 
 def cmd_resume(tmux: Tmux, it2: It2 | None, trace_dir, registry: dict, cfg: dict, query: str,
-               now: int | None = None) -> int:
+               now: int | None = None, prune: bool = True) -> int:
     """Bring a dead Claude session back: new tmux session, old cwd and color, `claude --resume <id>` typed in.
 
     Only tombstones are candidates (`resumable_trails`), so a live conversation can never be forked."""
     now = int(time.time()) if now is None else now
-    trails = resumable_trails(Path(trace_dir), registry, now, cfg["tombstones"]["keep_days"])
+    trails = resumable_trails(Path(trace_dir), registry, now, cfg["tombstones"]["keep_days"], prune)
     trail = find_trail(trails, query)
     if trail is None:
         print(f"kalmux: no trail matches {query!r} (see `kalmux dead`)", file=sys.stderr)
@@ -192,11 +227,13 @@ def cmd_forget(trace_dir, session_id: str, status_dir=None) -> int:
 
 # ----------------------------------------------------------------------------- restore after a crash or reboot
 def cmd_restore(tmux: Tmux, it2: It2, sessions_file: Path, previous_file: Path, dry_run: bool = False,
-                no_tabs: bool = False, env=None, now: int | None = None) -> int:
+                tabs: bool = False, env=None, now: int | None = None) -> int:
     """Bring back by hand what the tmux server that is gone had open; the ui server does it on its own.
 
     The CLI only ever READS the snapshot: rewriting it here would tell the next server start that the
-    restore has already happened."""
+    restore has already happened. `tabs` is `[restore] open_tabs` unless --tabs / --no-tabs said otherwise;
+    without tabs the sessions stay marked for the toolbelt. No wait for an unmounted volume here: the
+    user is at the keyboard, and a session that falls back keeps its directory for the next restore."""
     env = os.environ if env is None else env
     snap, source = tmrestore.restore_source(sessions_file, previous_file, tmrestore.live_state(tmux),
                                             tmrestore.boot_time())
@@ -212,10 +249,10 @@ def cmd_restore(tmux: Tmux, it2: It2, sessions_file: Path, previous_file: Path, 
     if dry_run:
         print("\n".join(tmrestore.plan(tmux, snap.sessions)))
         return 0
-    created = tmrestore.restore(tmux, snap.sessions, log=print)
     # the same rule as `kalmux go`: away from the desk, opening tabs would rearrange a Mac far from here
-    if created and not no_tabs and in_iterm2(env) and it2.available():
-        tmrestore.open_tabs(it2, created, socket=getattr(tmux, "socket", ""), log=print)
+    opening = bool(tabs and in_iterm2(env) and it2.available())
+    created = tmrestore.restore(tmux, snap.sessions, log=print, opening=opening, volume_wait=0)
+    tmrestore.open_or_say(tmux, it2, created, opening, log=print)
     return 0
 
 
@@ -332,12 +369,23 @@ def _ui_stop(wait: float = 5.0) -> int:
 
 
 # ----------------------------------------------------------------------------- setup / doctor
-def cmd_doctor(ui: bool = True, statusline: bool = True) -> int:
+def _doctor_report(ui: bool, statusline: bool) -> list[dict]:
     # read module-level paths at call time so tests (and callers) can override them
-    checks = doctor_checks(settings_path=DEFAULT_SETTINGS, hook_link=DEFAULT_HOOK_LINK, wrapper=WRAPPER, tmux_conf=DEFAULT_TMUX_CONF,
-                           ui_health=lambda: health(UI_PORT), ui=ui, state_dir=STATE_DIR, statusline=statusline)
+    return doctor_checks(settings_path=DEFAULT_SETTINGS, hook_link=DEFAULT_HOOK_LINK, wrapper=WRAPPER, tmux_conf=DEFAULT_TMUX_CONF,
+                         ui_health=lambda: health(UI_PORT), ui=ui, state_dir=STATE_DIR, statusline=statusline)
+
+
+def cmd_doctor(ui: bool = True, statusline: bool = True, fix: bool = False) -> int:
+    """Every check on one line; a red one gets its remedy on the next. --fix first re-applies the safe steps."""
+    checks = _doctor_report(ui, statusline)
+    if fix and not all(c["ok"] for c in checks):
+        tmsetup.run_fix(checks, ui=ui, statusline=statusline)
+        print()
+        checks = _doctor_report(ui, statusline)
     for c in checks:
         print(f"{'✓' if c['ok'] else '✗'} {c['name']}" + (f"  ({c['info']})" if c["info"] else ""))
+        if not c["ok"] and c.get("remedy"):
+            print(f"    fix: {c['remedy']}")
     return 0 if all(c["ok"] for c in checks) else 1
 
 
@@ -399,7 +447,9 @@ def build_parser() -> argparse.ArgumentParser:
     go = sub.add_parser("go", help="focus the iTerm2 tab of a session by name, or by part of its project or Claude title")
     go.add_argument("session", help="session name, or any text from its name, project or title")
     op = sub.add_parser("open", help="open a session as a new control-mode tab in the current iTerm2 window")
-    op.add_argument("session")
+    op.add_argument("session", nargs="?", default="")
+    op.add_argument("--restored", action="store_true",
+                    help="open every session a restore recreated that has not been opened yet")
     op.add_argument("--window", default="", help="iTerm2 window id (default: the current window)")
     at = sub.add_parser("attach", help="attach with the right verb for this terminal (-CC in iTerm2, switch-client inside tmux)")
     at.add_argument("session")
@@ -423,17 +473,23 @@ def build_parser() -> argparse.ArgumentParser:
     fg = sub.add_parser("forget", help="drop a dead session's trail so it stops showing up in `kalmux dead`")
     fg.add_argument("session_id")
     rs = sub.add_parser("restore", help="recreate the tmux sessions that were open before the tmux server "
-                                        "went away (name, directory and color), one iTerm2 tab each")
+                                        "went away (name, directory and color)")
     rs.add_argument("--dry-run", action="store_true", help="print what would happen and change nothing")
-    rs.add_argument("--no-tabs", action="store_true", help="recreate the sessions without opening any tab")
+    tabs = rs.add_mutually_exclusive_group()
+    tabs.add_argument("--tabs", dest="tabs", action="store_true", default=None,
+                      help="also open one iTerm2 tab per recreated session (default: [restore] open_tabs)")
+    tabs.add_argument("--no-tabs", dest="tabs", action="store_false",
+                      help="recreate the sessions without opening any tab")
     ra = sub.add_parser("reapply", help="re-send Claude status + tab color to attached panes (used by the tmux client-attached hook)")
     ra.add_argument("session", nargs="?")
     ui = sub.add_parser("ui", help="the toolbelt web UI server: serve | start | stop | restart | status | show | install (AutoLaunch + toolbelt) | uninstall | url")
     ui.add_argument("ui_cmd", choices=["serve", "start", "stop", "restart", "status", "show", "install", "uninstall", "url"])
     ui.add_argument("--port", type=int, default=UI_PORT)
-    doc = sub.add_parser("doctor", help="check hook, symlink, tmux.conf, iTerm2 prefs, AutoLaunch, toolbelt, ui server")
+    doc = sub.add_parser("doctor", help="check Claude Code hooks, symlinks, tmux.conf, iTerm2 prefs, AutoLaunch, toolbelt, ui server")
     doc.add_argument("--no-ui", action="store_true", help="skip the AutoLaunch / toolbelt / ui server checks")
     doc.add_argument("--no-statusline", action="store_true", help="skip the statusLine checks (nothing routed on purpose)")
+    doc.add_argument("--fix", action="store_true", help="re-apply only the failing idempotent setup steps (hooks, links, "
+                                                        "tmux.conf block, statusLine); lists what it runs and what needs you")
     setup = sub.add_parser("setup", help="install everything idempotently (symlinks, prefs, tmux.conf block, AutoLaunch, server, toolbelt)")
     setup.add_argument("--dry-run", action="store_true")
     setup.add_argument("--no-ui", action="store_true", help="skip the AutoLaunch script, server start and toolbelt registration")
@@ -459,6 +515,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "go":
         return cmd_go(tmux, It2(), args.session)
     if args.cmd == "open":
+        if bool(args.session) == args.restored:
+            print("kalmux open: give a session name or --restored (not both)", file=sys.stderr)
+            return 2
+        if args.restored:
+            return cmd_open_restored(tmux, It2(), args.window)
         return cmd_open(tmux, It2(), args.session, args.window)
     if args.cmd == "attach":
         return cmd_attach(tmux, args.session)
@@ -472,22 +533,23 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "rename":
         return _report(action_rename(tmux, args.session, args.name))
     if args.cmd == "dead":
-        cfg = load_config()
-        return cmd_dead(TRACE_DIR, load_registry(DEFAULT_REGISTRY), show_all=args.all, json_out=args.json,
-                        keep_days=cfg["tombstones"]["keep_days"])
+        cfg, registry = load_config(), load_registry(DEFAULT_REGISTRY)
+        return cmd_dead(TRACE_DIR, registry, show_all=args.all, json_out=args.json,
+                        keep_days=cfg["tombstones"]["keep_days"], prune=_hooks_healthy(registry))
     if args.cmd == "resume":
-        return cmd_resume(tmux, It2(), TRACE_DIR, load_registry(DEFAULT_REGISTRY), load_config(), args.session)
+        registry = load_registry(DEFAULT_REGISTRY)
+        return cmd_resume(tmux, It2(), TRACE_DIR, registry, load_config(), args.session, prune=_hooks_healthy(registry))
     if args.cmd == "forget":
         return cmd_forget(TRACE_DIR, args.session_id, STATUS_DIR)
     if args.cmd == "restore":
-        return cmd_restore(tmux, It2(), SESSIONS_FILE, PREVIOUS_SESSIONS_FILE, dry_run=args.dry_run,
-                           no_tabs=args.no_tabs)
+        tabs = load_config()["restore"]["open_tabs"] if args.tabs is None else args.tabs
+        return cmd_restore(tmux, It2(), SESSIONS_FILE, PREVIOUS_SESSIONS_FILE, dry_run=args.dry_run, tabs=tabs)
     if args.cmd == "reapply":
         return _report(reapply(tmux, args.session))
     if args.cmd == "ui":
         return cmd_ui(args)
     if args.cmd == "doctor":
-        return cmd_doctor(ui=not args.no_ui, statusline=not args.no_statusline)
+        return cmd_doctor(ui=not args.no_ui, statusline=not args.no_statusline, fix=args.fix)
     if args.cmd == "setup":
         return cmd_setup(dry_run=args.dry_run, ui=not args.no_ui, statusline=not args.no_statusline)
     if args.cmd == "config":

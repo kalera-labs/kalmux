@@ -106,7 +106,7 @@ def test_pane_shells_and_foreground_busy(tm):
 
 def test_fields_and_format_stay_in_lockstep(tm):
     """parse_panes drops every record whose field count differs, so a desync empties the CLI and the UI silently."""
-    assert len(tmcore.FIELDS) == len(tmcore.TMUX_FMT.split(tmcore.SEP)) == 17
+    assert len(tmcore.FIELDS) == len(tmcore.TMUX_FMT.split(tmcore.SEP)) == 19
     assert tmcore.parse_panes(tmux_line(pane("x")))[0]["dead"] == "0"
 
 
@@ -219,11 +219,99 @@ def test_merge_flags_stale_gone_and_orphaned_state(tm):
         pane("orphan", pane_id="%3", window_id="@3", state="working", since=str(now - 5), cmd="zsh"),
     ], {"dead:@2.%2": {"status": "busy", "alive": False, "sessionId": "d", "name": "", "cwd": ""}}, now=now)
     by = {r["session"]: r for r in rows}
-    assert by["old"]["state"] == "working" and by["old"]["stale"] is True
+    assert by["old"]["state"] == "working" and by["old"]["overdue"] is True
     assert by["dead"]["state"] == "gone"
     assert by["orphan"]["state"] == "stale"
     out = tm.render_table(rows)
     assert "working?" in out and "gone" in out
+
+
+def test_load_registry_carries_waiting_for(tm, tmp_path):
+    (tmp_path / "1.json").write_text(json.dumps({"pid": 1, "sessionId": "s", "tmux": "w:@1.%1", "status": "waiting",
+                                                 "waitingFor": "permission prompt"}))
+    (tmp_path / "2.json").write_text(json.dumps({"pid": 2, "sessionId": "t", "tmux": "i:@1.%1", "status": "idle"}))
+    reg = tm.load_registry(tmp_path, alive=lambda pid: True)
+    assert reg["w:@1.%1"]["waitingFor"] == "permission prompt" and reg["i:@1.%1"]["waitingFor"] == ""
+
+
+def test_merge_maps_a_waiting_registry_status_and_carries_waiting_for(tm):
+    now = 100_000
+    reg = {"w:@1.%1": {"status": "waiting", "waitingFor": "permission prompt", "alive": True, "sessionId": "s", "name": "",
+                       "cwd": "", "statusUpdatedAt": (now - 20) * 1000},
+           "b:@2.%2": {"status": "busy", "waitingFor": "", "alive": True, "sessionId": "t", "name": "", "cwd": "",
+                       "statusUpdatedAt": (now - 20) * 1000}}
+    rows = tm.merge([pane("w", pane_id="%1", window_id="@1"), pane("b", pane_id="%2", window_id="@2")], reg, now=now)
+    by = {r["session"]: r for r in rows}
+    assert by["w"]["state"] == "waiting" and by["w"]["source"] == "registry" and by["w"]["detail"] == "permission prompt"
+    assert by["w"]["age"] == 20 and by["b"]["state"] == "working" and by["b"]["detail"] == ""
+    assert tmcore.state_label(by["w"]) == "waiting~"
+
+
+def test_merge_maps_the_registry_shell_status_to_idle_with_a_background_shell(tm):
+    # Claude 2.1.312 writes "shell" for an idle prompt while a background shell task still runs
+    now = 100_000
+    reg = {"s:@1.%1": {"status": "shell", "waitingFor": "", "alive": True, "sessionId": "s", "name": "", "cwd": "",
+                       "statusUpdatedAt": (now - 20) * 1000}}
+    row = tm.merge([pane("s", pane_id="%1", window_id="@1")], reg, now=now)[0]
+    assert row["state"] == "idle" and row["source"] == "registry" and row["detail"] == "background shell"
+
+
+def test_a_hook_detail_wins_over_the_registry_waiting_for(tm):
+    now = 100_000
+    reg = {"w:@1.%1": {"status": "waiting", "waitingFor": "input needed", "alive": True, "sessionId": "s", "name": "", "cwd": "",
+                       "statusUpdatedAt": now * 1000}}
+    row = tm.merge([pane("w", state="waiting", detail="Allow Bash?", since=str(now - 2))], reg, now=now)[0]
+    assert row["source"] == "hook" and row["detail"] == "Allow Bash?"
+
+
+# ---------- overdue: liveness, not time in state ----------
+_SID = "11111111-2222-3333-4444-555555555555"
+
+
+def _busy_for_hours(now):
+    sid = _SID
+    return {"a:@1.%1": {"status": "busy", "waitingFor": "", "name": "", "cwd": "", "sessionId": sid, "alive": True,
+                        "statusUpdatedAt": (now - 8 * 3600) * 1000}}
+
+
+def test_overdue_needs_silence_not_just_a_long_state(tm):
+    now = 1_000_000
+    reg = _busy_for_hours(now)
+    quiet = tm.merge([pane("a")], reg, now=now)[0]
+    assert quiet["state"] == "working" and quiet["age"] == 8 * 3600 and quiet["overdue"] is True and "stale" not in quiet
+    ticking = tm.merge([pane("a")], reg, now=now, status={_SID: {"ts": now - 90, "context_pct": 1}})[0]
+    assert ticking["age"] == 8 * 3600 and ticking["overdue"] is False                 # age stays time-in-state
+    old_tick = tm.merge([pane("a")], reg, now=now, status={_SID: {"ts": now - 3000}})[0]
+    assert old_tick["overdue"] is True
+
+
+def test_overdue_looks_at_the_transcript_only_when_it_could_matter(tm):
+    now = 1_000_000
+    reg = _busy_for_hours(now)
+    status = {_SID: {"ts": now - 3000, "transcript_path": "/t/a.jsonl"}}
+    seen = []
+
+    def fresh(record):
+        seen.append(record["transcript_path"])
+        return now - 11
+
+    row = tm.merge([pane("a")], reg, now=now, status=status, mtime=fresh)[0]
+    assert row["overdue"] is False and seen == ["/t/a.jsonl"]
+    seen.clear()
+    idle = {"a:@1.%1": {**reg["a:@1.%1"], "status": "idle"}}
+    assert tm.merge([pane("a")], idle, now=now, status=status, mtime=fresh)[0]["overdue"] is False
+    young = {"a:@1.%1": {**reg["a:@1.%1"], "statusUpdatedAt": (now - 60) * 1000}}
+    tm.merge([pane("a")], young, now=now, status=status, mtime=fresh)
+    assert seen == []                                                                # nothing to decide: no stat
+
+
+def test_transcript_mtime_reads_the_file_and_shrugs_off_junk(tm, tmp_path):
+    f = tmp_path / "t.jsonl"
+    f.write_text("{}")
+    os.utime(f, (500, 500))
+    assert tmcore.transcript_mtime({"transcript_path": str(f)}) == 500
+    for record in ({"transcript_path": str(tmp_path / "missing")}, {"transcript_path": 7}, {}, None):
+        assert tmcore.transcript_mtime(record) is None
 
 
 def test_sort_rows_priority(tm):
@@ -388,6 +476,8 @@ def test_real_tmux_wrapper_roundtrip(tm, fake_bins):
     panes = t.list_panes()
     assert panes[0]["session"] == "api" and panes[0]["cc_state"] == "working" and panes[0]["tty"] == fake_bins["tty"]
     assert t.show_session_option("api", "@tm_color") == "#ff9500"
+    assert "show -t $0 -qv @tm_color" in fake_bins["log"].read_text()       # by id: `-t =api` answers nothing
+    assert t.show_session_option("nope", "@tm_color") == ""
     t.set_session_option("api", "@tm_color", "#00ff00")
     t.set_session_option("api", "@tm_color", None)
     assert t.pane_tty("%0") == fake_bins["tty"] and t.path == str(fake_bins["bin"] / "tmux")
@@ -693,14 +783,43 @@ def test_merge_adds_context_model_cost_and_quota(tm):
     assert r["quota"]["five_hour"]["used_pct"] == 35
 
 
-def test_merge_ignores_status_records_older_than_an_hour(tm):
+def test_merge_ignores_old_status_records_of_a_session_that_is_gone(tm):
     now = 1_000_000
-    reg = {"a:@1.%1": {"status": "busy", "name": "", "cwd": "", "sessionId": SID_A, "alive": True, "statusUpdatedAt": None}}
+    reg = {"a:@1.%1": {"status": "busy", "name": "", "cwd": "", "sessionId": SID_A, "alive": False, "statusUpdatedAt": None}}
     status = {SID_A: {"ts": now - 3601, "model": "Opus 5", "context_pct": 42, "cost_usd": 1.0, "rate_limits": {}}}
-    stale = tm.merge([pane("a")], reg, now=now, status=status)[0]
-    assert (stale["ctx_pct"], stale["model"], stale["cost_usd"], stale["quota"], stale["status_age"]) == (None, "", None, None, None)
+    dead = tm.merge([pane("a")], reg, now=now, status=status)[0]
+    assert (dead["ctx_pct"], dead["model"], dead["cost_usd"], dead["quota"], dead["status_age"]) == (None, "", None, None, None)
     none = tm.merge([pane("a")], reg, now=now)[0]                 # no status directory at all
     assert none["ctx_pct"] is None and none["model"] == "" and none["quota"] is None
+
+
+def test_merge_keeps_old_status_records_of_an_alive_idle_session(tm):
+    now = 1_000_000
+    reg = {"a:@1.%1": {"status": "idle", "name": "", "cwd": "", "sessionId": SID_A, "alive": True, "statusUpdatedAt": None}}
+    status = {SID_A: {"ts": now - 5 * 3600, "model": "Opus 5", "context_pct": 71, "cost_usd": 2615.79, "rate_limits": {}}}
+    row = tm.merge([pane("a")], reg, now=now, status=status)[0]
+    assert (row["ctx_pct"], row["model"], row["cost_usd"], row["status_age"]) == (71, "Opus 5", 2615.79, 5 * 3600)
+    assert tmcore.status_fields(status[SID_A], now) == tmcore.status_fields(status[SID_A], now, alive=False)
+    assert tmcore.status_fields(status[SID_A], now)["ctx_pct"] is None            # no registry knowledge: still aged out
+
+
+def test_an_old_record_of_an_alive_session_keeps_its_gauge_but_not_its_quota(tm):
+    """The 5 h window of a record from last night has reset since: a quota reading is only as good as its age."""
+    now = 1_800_000_000
+    old = {"ts": now - 6 * 3600, "context_pct": 50, "rate_limits": {"five_hour": {"used_pct": 92, "resets_at": now - 5 * 3600}}}
+    fields = tmcore.status_fields(old, now, alive=True)
+    assert fields["ctx_pct"] == 50 and fields["quota"] is None
+
+
+def test_a_fresh_record_drops_a_window_that_has_already_reset(tm):
+    now = 1_800_000_000
+    rec = {"ts": now - 30, "rate_limits": {"five_hour": {"used_pct": 92, "resets_at": now - 10},
+                                           "seven_day": {"used_pct": 40, "resets_at": now + 3600}}}
+    assert tmcore.status_fields(rec, now)["quota"] == {"seven_day": {"used_pct": 40, "resets_at": now + 3600}}
+    rec["rate_limits"] = {"five_hour": {"used_pct": 92, "resets_at": now - 10}}
+    assert tmcore.status_fields(rec, now)["quota"] is None
+    rec["rate_limits"] = {"five_hour": {"used_pct": 12}}                       # no reset time: kept
+    assert tmcore.status_fields(rec, now)["quota"] == {"five_hour": {"used_pct": 12, "resets_at": None}}
 
 
 def test_render_table_has_a_ctx_column(tm):
@@ -965,7 +1084,7 @@ def test_cmd_restore_recreates_the_previous_boots_sessions(tm, tmp_path, monkeyp
     monkeypatch.setattr(tmrestore, "boot_time", lambda: 222)
     path = write_sessions(tmp_path / "sessions.json", 111, "api", "web", cwd=str(tmp_path))
     t, it2 = FakeTmux(panes=[pane("api")]), FakeIt2(window="pty-CUR")
-    assert tm.cmd_restore(t, it2, path, tmp_path / "prev.json") == 0
+    assert tm.cmd_restore(t, it2, path, tmp_path / "prev.json", tabs=True) == 0
     out = capsys.readouterr().out
     assert "boot 111" in out and str(path) in out
     assert t.has_session("web") and ("new", "web", str(tmp_path)) in t.calls
@@ -980,7 +1099,7 @@ def test_cmd_restore_dry_run_changes_nothing(tm, tmp_path, monkeypatch, capsys):
     t, it2 = FakeTmux(panes=[pane("api")]), FakeIt2(window="pty-CUR")
     assert tm.cmd_restore(t, it2, path, tmp_path / "prev.json", dry_run=True) == 0
     out = capsys.readouterr().out
-    assert "exists  api" in out and "create  web" in out and "/nowhere-at-all is gone" in out
+    assert "exists  api" in out and "create  web" in out and "/nowhere-at-all is not there" in out
     assert not t.has_session("web") and it2.tabs == []
 
 
@@ -990,9 +1109,10 @@ def test_cmd_restore_opens_no_tab_outside_iterm2_or_with_no_tabs(tm, tmp_path, m
     path = write_sessions(tmp_path / "sessions.json", 111, "web", cwd=str(tmp_path))
     monkeypatch.setattr(tm.os, "environ", {"SSH_TTY": "/dev/ttys001"})
     it2 = FakeIt2(window="pty-CUR")
-    assert tm.cmd_restore(FakeTmux(panes=[]), it2, path, tmp_path / "prev.json") == 0 and it2.tabs == []
+    assert tm.cmd_restore(FakeTmux(panes=[]), it2, path, tmp_path / "prev.json", tabs=True) == 0
+    assert it2.tabs == []
     monkeypatch.setattr(tm.os, "environ", {"TERM_PROGRAM": "iTerm.app"})
-    assert tm.cmd_restore(FakeTmux(panes=[]), it2, path, tmp_path / "prev.json", no_tabs=True) == 0
+    assert tm.cmd_restore(FakeTmux(panes=[]), it2, path, tmp_path / "prev.json", tabs=False) == 0
     assert it2.tabs == []
     capsys.readouterr()
 
@@ -1021,7 +1141,69 @@ def test_main_dispatches_restore_and_ui_serve_keeps_sessions(tm, tmp_path, monke
     assert tm.main(["restore", "--dry-run", "--no-tabs"]) == 0
     args, kwargs = seen["restore"]
     assert args[2:] == (tm.SESSIONS_FILE, tm.PREVIOUS_SESSIONS_FILE)
-    assert kwargs == {"dry_run": True, "no_tabs": True}
+    assert kwargs == {"dry_run": True, "tabs": False}
     monkeypatch.setattr(tm, "serve", record("serve"))
     assert tm.main(["ui", "serve"]) == 0
     assert seen["serve"][1]["keep_sessions"] is True and seen["serve"][1]["pidfile"] == tm.PIDFILE
+
+
+# ---------- trails are evidence: never pruned while the hook is not reaching Kalmux ----------
+def test_load_trails_keeps_old_files_when_pruning_is_off(tm, tmp_path):
+    trace = tmp_path / "trace"
+    now = 40 * 86400
+    old = write_trail(trace, SID_A, [{"ts": 10, "event": "SessionStart"}], mtime=now - 31 * 86400)
+    assert [t["session_id"] for t in tmcore.load_trails(trace, now=now, keep_days=30, prune=False)] == [SID_A]
+    assert old.exists()
+    assert tmcore.resumable_trails(trace, {}, now=now, keep_days=30, prune=False)[0]["session_id"] == SID_A
+    assert old.exists()
+
+
+def test_cmd_dead_does_not_prune_while_the_hook_is_unhealthy(tm, tmp_path, capsys):
+    trace = tmp_path / "trace"
+    now = 40 * 86400
+    old = write_trail(trace, SID_A, [{"ts": 10, "event": "SessionEnd", "tmux_session": "a"}], mtime=now - 31 * 86400)
+    assert tm.cmd_dead(trace, {}, now=now, prune=False) == 0
+    assert old.exists()
+    assert tm.cmd_dead(trace, {}, now=now) == 0
+    assert not old.exists()
+
+
+def test_main_dead_and_resume_ask_the_hook_health_before_pruning(tm, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(tm, "_hooks_healthy", lambda registry: False)
+    monkeypatch.setattr(tm, "cmd_dead", lambda *a, **kw: seen.update(dead=kw) or 0)
+    monkeypatch.setattr(tm, "cmd_resume", lambda *a, **kw: seen.update(resume=kw) or 0)
+    assert tm.main(["dead"]) == 0 and seen["dead"]["prune"] is False
+    assert tm.main(["resume", "x"]) == 0 and seen["resume"]["prune"] is False
+
+
+def test_hooks_healthy_reads_the_configured_paths(tm, monkeypatch):
+    asked = []
+    monkeypatch.setattr(tm.tmhooks, "hook_health", lambda *a: asked.append(a) or {"ok": True})
+    assert tm._hooks_healthy({"r": 1}) is True
+    assert asked[0] == (tm.DEFAULT_SETTINGS, tm.WRAPPER, tm.STATE_DIR, {"r": 1})
+
+
+def test_cmd_doctor_prints_a_remedy_under_each_red_line(tm, monkeypatch, capsys):
+    monkeypatch.setattr(tm, "doctor_checks", lambda **kw: [
+        {"name": "good", "ok": True, "info": "", "remedy": ""},
+        {"name": "bad", "ok": False, "info": "why", "remedy": "kalmux doctor --fix", "fix": "x"}])
+    assert tm.cmd_doctor() == 1
+    assert "✗ bad  (why)\n    fix: kalmux doctor --fix" in capsys.readouterr().out
+
+
+def test_cmd_doctor_fix_runs_the_plan_then_reports_again(tm, monkeypatch, capsys):
+    reports = [[{"name": "bad", "ok": False, "info": "", "remedy": "r", "fix": tmsetup.HOOKS_STEP}],
+               [{"name": "bad", "ok": True, "info": "", "remedy": ""}]]
+    monkeypatch.setattr(tm, "doctor_checks", lambda **kw: reports.pop(0))
+    fixed = []
+    monkeypatch.setattr(tmsetup, "run_fix", lambda checks, **kw: fixed.append((checks, kw)) or 0)
+    assert tm.main(["doctor", "--fix"]) == 0
+    assert fixed and fixed[0][1] == {"ui": True, "statusline": True}
+    assert "✓ bad" in capsys.readouterr().out
+
+
+def test_cmd_doctor_fix_with_nothing_red_runs_nothing(tm, monkeypatch):
+    monkeypatch.setattr(tm, "doctor_checks", lambda **kw: [{"name": "ok", "ok": True, "info": "", "remedy": ""}])
+    monkeypatch.setattr(tmsetup, "run_fix", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("ran")))
+    assert tm.cmd_doctor(fix=True) == 0

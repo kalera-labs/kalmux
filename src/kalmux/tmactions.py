@@ -19,6 +19,7 @@ from .tmcore import (
     CLEAR_WORDS,
     CTRL_RE,
     HEX_RE,
+    RESTORED_OPTION,
     STATE_ORDER,
     It2,
     Tmux,
@@ -35,13 +36,14 @@ from .tmcore import (
     valid_session_name,
     write_tty,
 )
+from .tmsnapshot import clear_restored, displaced, pending_restored, restored_at
 
-# same colors as bin/cc-status-tmux (and iTerm2's own cc-status)
+# same colors as assets/kalmux-hook (and iTerm2's own cc-status)
 STATUS_COLORS = {"working": ("#ff9500", "#ff9500"), "waiting": ("#5f87ff", "#5f87ff"), "idle": ("#00d75f", "#888888")}
 STATE_WORD_RE = re.compile(r"[^A-Za-z0-9_-]")
 MAX_RESUME_SUFFIX = 1000
 SEARCH_KEYS = ("name", "session", "project", "title")
-# what bin/cc-status-tmux writes on SessionEnd: an empty status plus an empty SetUserVar payload
+# what assets/kalmux-hook writes on SessionEnd: an empty status plus an empty SetUserVar payload
 CLEAR_STATUS = ("\x1b]21337;status=;indicator=;status-color=;detail=\x1b\\"
                 "\x1b]1337;SetUserVar=cc_state=\x07")
 NAME_RULE = "name must start with a letter, digit or _ and use only letters, digits, _ and - (max 64)"
@@ -125,27 +127,38 @@ class TabMap:
 
 
 # ----------------------------------------------------------------------------- snapshot
-PANE_KEYS = ("pane", "window_id", "pane_id", "claude", "state", "source", "detail", "title", "age", "stale", "path",
-             "active", "claude_session_id", "ctx_pct", "model", "cost_usd", "quota")
-CONTEXT_KEYS = ("claude_session_id", "ctx_pct", "model", "cost_usd", "quota")
-BLANK_CONTEXT = {"claude_session_id": "", "ctx_pct": None, "model": "", "cost_usd": None, "quota": None}
+PANE_KEYS = ("pane", "window_id", "pane_id", "claude", "state", "source", "detail", "title", "age", "overdue", "path",
+             "active", "claude_session_id", "ctx_pct", "model", "cost_usd", "quota", "status_age")
+CONTEXT_KEYS = ("claude_session_id", "ctx_pct", "model", "cost_usd", "quota", "status_age")
+BLANK_CONTEXT = {"claude_session_id": "", "ctx_pct": None, "model": "", "cost_usd": None, "quota": None, "status_age": None}
 
 
 def _pane_rank(p: dict) -> tuple:
     return (STATE_ORDER.get(p["state"], 9), not p["active"])
 
 
-def _session_entry(s: dict) -> dict:
-    """One session row: the state of its most urgent pane, the context of its most urgent Claude pane."""
+def _session_entry(s: dict, restored: int | None = None, fallback: str = "") -> dict:
+    """One session row: the state of its most urgent pane, the context of its most urgent Claude pane.
+
+    `restored` is when a restore recreated it, while nobody has opened it yet; `fallback` the directory it
+    belongs in while it sits in the $HOME a restore had to put it in."""
     best = min(s["panes"], key=_pane_rank)
     claude = [p for p in s["panes"] if p["claude_session_id"]]
     lead = min(claude, key=_pane_rank) if claude else BLANK_CONTEXT
     path = best["path"]
-    return {**s, "state": best["state"], "age": best["age"], "stale": best["stale"], "source": best["source"],
+    return {**s, "state": best["state"], "age": best["age"], "overdue": best["overdue"], "source": best["source"],
             "detail": best["detail"], "title": best["title"], "path": path,
             "project": os.path.basename(path.rstrip("/")) or path,
             "in_iterm2": any(p["guid"] for p in s["panes"]),
+            "restored": restored is not None, "restored_at": restored, "cwd_fallback": fallback,
             **{k: lead[k] for k in CONTEXT_KEYS}}
+
+
+def restored_summary(restored: dict[str, int], moved: dict[str, str]) -> dict:
+    """The banner's numbers: the sessions waiting for a tab since a restore (in tmux's order), since when,
+    and how many still sit in a fallback directory."""
+    return {"count": len(restored), "at": max(restored.values(), default=None), "names": list(restored),
+            "fallbacks": len(moved)}
 
 
 def _five_hour_pct(quota: dict) -> float:
@@ -160,16 +173,18 @@ def top_quota(sessions: list[dict]) -> dict | None:
     return max(quotas, key=_five_hour_pct) if quotas else None
 
 
-def _tombstones(registry: dict, trace_dir, now: int, keep_days: int, superseded: bool) -> list[dict]:
+def _tombstones(registry: dict, trace_dir, now: int, keep_days: int, superseded: bool, prune: bool = True) -> list[dict]:
     if not trace_dir:
         return []
-    rows = tombstones(load_trails(Path(trace_dir), now, keep_days), registry)
+    rows = tombstones(load_trails(Path(trace_dir), now, keep_days, prune), registry)
     return rows if superseded else [r for r in rows if r["ended"] != "superseded"]
 
 
 def snapshot(tmux: Tmux, registry_dir: Path, tabmap: TabMap | None, now: int | None = None, status_dir=None,
-             trace_dir=None, keep_days: int = 30, superseded: bool = False) -> dict:
-    """Everything the UI needs in one JSON-able dict: sessions (sorted by urgency) with their panes."""
+             trace_dir=None, keep_days: int = 30, superseded: bool = False, prune_trails: bool = True) -> dict:
+    """Everything the UI needs in one JSON-able dict: sessions (sorted by urgency) with their panes.
+
+    prune_trails=False while the hook is not reaching Kalmux: old trails are then the only record left."""
     now = int(time.time()) if now is None else now
     panes = tmux.list_panes()
     registry = load_registry(registry_dir)
@@ -183,15 +198,19 @@ def snapshot(tmux: Tmux, registry_dir: Path, tabmap: TabMap | None, now: int | N
         s = sessions.setdefault(r["session"], {"name": r["session"], "color": r["color"],
                                                "attached": int(r["attached"]) if str(r["attached"]).isdigit() else 0, "panes": []})
         s["panes"].append(pane)
-    out = [_session_entry(s) for s in sessions.values()]
+    restored, moved = pending_restored(panes), displaced(panes)
+    out = [_session_entry(s, restored.get(s["name"]), moved.get(s["name"], "")) for s in sessions.values()]
     out.sort(key=lambda s: (STATE_ORDER.get(s["state"], 9), s["name"]))
     counts = dict.fromkeys(("waiting", "working", "idle", "busy", "unknown", "stale", "gone"), 0)
+    counts["overdue"] = 0                      # a flag on working/waiting cards, not a state (state "stale" is a hook leftover)
     for s in out:
         if s["state"] in counts:
             counts[s["state"]] += 1
+        counts["overdue"] += bool(s["overdue"])
     counts["total"] = len(out)
     return {"now": now, "counts": counts, "sessions": out, "quota": top_quota(out),
-            "tombstones": _tombstones(registry, trace_dir, now, keep_days, superseded)}
+            "restored": restored_summary(restored, moved),
+            "tombstones": _tombstones(registry, trace_dir, now, keep_days, superseded, prune_trails)}
 
 
 def next_waiting(sessions: list[dict]) -> str | None:
@@ -295,6 +314,8 @@ def action_go(tmux: Tmux, it2: It2, tabmap: TabMap, session: str, env=None) -> R
     guid = tabs[best["pane_id"]]["guid"]
     if not it2.focus(guid):
         return Result(False, f"it2 could not focus tab {guid}")
+    if any(restored_at(p) for p in panes):
+        clear_restored(tmux, session)
     return Result(True, f"focused {session}", {"opened": False, "guid": guid})
 
 
@@ -319,6 +340,8 @@ def action_open(tmux: Tmux, it2: It2, session: str, window: str = "") -> Result:
         where = "window"
     if not ok:
         return Result(False, f"it2 {where} new failed: {out or 'unknown error'}")
+    if tmux.show_session_option(session, RESTORED_OPTION):
+        clear_restored(tmux, session)          # opened through Kalmux: no longer waiting for a tab
     return Result(True, f"opened {session} in a new {where}", {"opened": True, "window": window, "it2": out})
 
 
@@ -497,6 +520,22 @@ def action_rename(tmux: Tmux, session: str, new_name: str) -> Result:
     if not tmux.rename_session(session, new_name):
         return Result(False, f"tmux could not rename {session!r}")
     return Result(True, f"renamed {session} -> {new_name}", {"name": new_name})
+
+
+def action_dismiss_restored(tmux: Tmux, session="") -> Result:
+    """Forget that a restore recreated these sessions (every one waiting, or the one named): they stay as
+    they are and stop asking for a tab."""
+    if not isinstance(session, str):
+        return Result(False, "session must be a session name")
+    waiting = list(pending_restored(tmux.list_panes()))
+    name = _text(session, 128)
+    if name and name not in waiting:
+        return Result(False, f"{name!r} is not a restored session waiting for a tab")
+    names = [name] if name else waiting
+    if not names:
+        return Result(False, "no restored session is waiting for a tab")
+    dismissed = [n for n in names if clear_restored(tmux, n)]
+    return Result(bool(dismissed), f"dismissed {len(dismissed)} restored session(s)", {"dismissed": dismissed})
 
 
 def action_detach(tmux: Tmux, session: str) -> Result:

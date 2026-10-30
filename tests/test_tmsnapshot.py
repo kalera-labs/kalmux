@@ -79,7 +79,7 @@ def test_live_sessions_keeps_creation_order_even_when_tmux_lists_them_alphabetic
 
 def test_live_sessions_skips_records_with_the_wrong_number_of_fields(monkeypatch):
     tmux = fake_tmux("api")
-    monkeypatch.setattr(tmux, "run_rc", lambda *_a: (0, "short\nalpha\x1f/tmp\x1f\x1f7\n"))
+    monkeypatch.setattr(tmux, "run_rc", lambda *_a: (0, "short\nalpha\x1f/tmp\x1f\x1f\x1f7\n"))
     assert [s.name for s in tmsnapshot.live_sessions(tmux)] == ["alpha"]
 
 
@@ -87,7 +87,7 @@ def test_live_sessions_keeps_a_session_whose_directory_name_holds_a_newline(monk
     """macOS allows a newline in a directory name and tmux passes #{pane_current_path} through verbatim:
     splitting the output on "\\n" would break that record in two and drop the session for good."""
     tmux = fake_tmux("api")
-    out = "api\x1f/tmp/two\nlines\x1f#0a84ff\x1f1000\nweb\x1f/tmp\x1f\x1f1001\n"
+    out = "api\x1f/tmp/two\nlines\x1f\x1f#0a84ff\x1f1000\nweb\x1f/tmp\x1f\x1f\x1f1001\n"
     monkeypatch.setattr(tmux, "run_rc", lambda *_a: (0, out))
     rows = tmsnapshot.live_sessions(tmux)
     assert [s.name for s in rows] == ["api", "web"]
@@ -132,7 +132,7 @@ def test_live_state_is_none_when_no_server_is_running():
 def test_live_state_is_none_when_the_identity_line_makes_no_sense(answer, monkeypatch):
     """A pid of 0 (or a missing field) would compare equal across two servers and silence the restore."""
     tmux = fake_tmux("api")
-    monkeypatch.setattr(tmux, "run_rc", lambda *a: (0, answer) if a[0] == "display" else (0, "api\x1f/tmp\x1f\x1f1\n"))
+    monkeypatch.setattr(tmux, "run_rc", lambda *a: (0, answer) if a[0] == "display" else (0, "api\x1f/tmp\x1f\x1f\x1f1\n"))
     assert tmsnapshot.live_state(tmux) is None
 
 
