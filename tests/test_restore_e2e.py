@@ -56,6 +56,14 @@ def no_server_left_behind():
             pytest.fail(f"a test left a tmux server running on -L {socket}")
 
 
+@pytest.fixture(autouse=True)
+def plain_shell(monkeypatch):
+    """Panes run /bin/sh, not the user's login shell: tmux takes default-shell from $SHELL when the server
+    starts, and a login shell's startup (prompt helpers, an rc file) can move pane_current_path while a
+    test compares two snapshots taken a moment apart."""
+    monkeypatch.setenv("SHELL", "/bin/sh")
+
+
 @pytest.fixture
 def private_tmux():
     """A hermetic Tmux bound to our own socket; the teardown lets its server go (see _let_go)."""
