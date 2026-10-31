@@ -21,7 +21,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import tmhooks, tmrestore
+from . import tmhooks, tmrestore, tmsession
 from .tmactions import (
     Result,
     TabMap,
@@ -119,6 +119,7 @@ class Backend:
         self.tabmap = TabMap(it2)
         self.token = secrets.token_urlsafe(24)
         self.started_at = int(time.time())
+        self.asid = tmsession.audit_session()      # the login session this server lives in (see tmsession)
         self.reapply_delay = reapply_delay
         self.lock = threading.Lock()
         # set by serve(keep_sessions=True) only: a Backend built in a test keeps no sessions and starts
@@ -165,7 +166,7 @@ class Backend:
     def health(self) -> dict:
         # `tmux` tells `tm doctor` whether THIS process can see tmux (its PATH may differ from the shell's)
         return {"app": APP_NAME, "version": VERSION, "pid": os.getpid(), "started_at": self.started_at,
-                "tmux": getattr(self.tmux, "path", "")}
+                "tmux": getattr(self.tmux, "path", ""), "asid": self.asid}
 
     def state(self) -> dict:
         hook = self.hook_status()

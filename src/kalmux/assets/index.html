@@ -185,7 +185,7 @@ button{background:none;border:0;cursor:pointer;padding:0}
   <div id="live" title="offline" role="status" aria-label="Connection"></div>
   <div class="hrow">
     <span id="brand">Kalmux</span>
-    <span id="noit2" class="b" hidden title="iTerm2 is not answering (it2 failed, or its Python API is off): jumping to a tab and opening one will fail">iTerm2 silent</span>
+    <span id="noit2" class="b" hidden title="iTerm2 is not answering (it2 failed, or its Python API is off): jumping to a tab and opening one will fail. After a crash or a logout, run kalmux ui restart in an iTerm2 tab">iTerm2 silent</span>
     <span id="quota" class="b" hidden title="Claude rate limit"></span>
     <span id="livedot" class="dim" title="offline">○</span>
     <button class="ic" id="add" title="New session" aria-label="New session">＋</button>
@@ -500,7 +500,7 @@ function render(){
   if (it2.installed === false) {                       // no iTerm2 at all (e.g. the page opened over ssh)
     setTxt(noit2, 'no iTerm2'); noit2.title = 'iTerm2 (it2) is not installed here: jumping to and opening tabs is unavailable';
   } else {
-    setTxt(noit2, 'iTerm2 silent'); noit2.title = 'iTerm2 is not answering (it2 failed, or its Python API is off): jumping to a tab and opening one will fail';
+    setTxt(noit2, 'iTerm2 silent'); noit2.title = 'iTerm2 is not answering (it2 failed, or its Python API is off): jumping to a tab and opening one will fail. After a crash or a logout, run kalmux ui restart in an iTerm2 tab';
   }
   if (sv.version) $('#brand').title = 'Kalmux v' + sv.version;
   renderQuota(data.quota);

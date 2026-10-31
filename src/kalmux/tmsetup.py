@@ -27,6 +27,7 @@ from .tmcore import (
     ROOT,
     SOURCE_CHECKOUT,
     VERSION,
+    It2,
     _decode,
     fmt_age,
     homebrew_keg,
@@ -86,6 +87,7 @@ HOOKS_CHECK = "Claude Code hooks call Kalmux"
 CLI_STEP = "kalmux symlink"
 TMUX_CONF_STEP = "tmux.conf block"
 EXIT_EMPTY_CHECK = "tmux.conf exit-empty off (a killed last session stays killed)"
+SESSION_CHECK = "ui server in this login session"
 # what `kalmux doctor --fix` may run on its own: idempotent, and nothing that writes iTerm2's preferences,
 # its AutoLaunch folder or its toolbelt, or starts a server (those print the command to run instead)
 SAFE_FIX_STEPS = frozenset({HOOKS_STEP, CLI_STEP, TMUX_CONF_STEP, STATUSLINE_STEP,
@@ -690,7 +692,13 @@ def _check_iterm(checks: Checks, reader, ui: bool, autolaunch, autolaunch_paths)
                    "kalmux ui install (bakes the current interpreter and command)")
 
 
-def _check_ui(checks: Checks, h: dict | None, state_dir: Path, snapshot_status) -> None:
+def _ui_left_over(h: dict) -> bool:
+    # imported here, not at module level: ctypes would land on the `kalmux statusline` hot path (see start_server)
+    from . import tmsession
+    return tmsession.caller_left_over(h, It2)
+
+
+def _check_ui(checks: Checks, h: dict | None, state_dir: Path, snapshot_status, left_over=None) -> None:
     checks.add("ui server reachable", bool(h), f"{UI_URL} pid {h.get('pid')}" if h else f"{UI_URL} not answering (kalmux ui start)",
                "kalmux ui start (from a shell inside iTerm2)")
     if not h:
@@ -698,6 +706,11 @@ def _check_ui(checks: Checks, h: dict | None, state_dir: Path, snapshot_status) 
     checks.add("ui server can run tmux", bool(h.get("tmux")),
                h.get("tmux") or "the server's PATH has no tmux: `kalmux ui restart` from an iTerm2 shell, then `kalmux ui install`",
                "kalmux ui restart from an iTerm2 shell, then kalmux ui install")
+    stuck = (left_over or _ui_left_over)(h)
+    where = f"session {h['asid']}" if isinstance(h.get("asid"), int) else "a session it does not report (before 0.6.1)"
+    checks.add(SESSION_CHECK, not stuck,
+               f"server pid {h.get('pid')} in {where}" + (", this shell in a newer login that reaches iTerm2" if stuck else ""),
+               "kalmux ui restart, in an iTerm2 tab (the server outlived a logout or a crash and cannot reach iTerm2)")
     running = h.get("version") or "unknown"
     checks.add("ui server runs this code", running == VERSION,
                f"server {running}, checkout {VERSION}" + ("" if running == VERSION else ", kalmux ui restart (from an iTerm2 shell)"),

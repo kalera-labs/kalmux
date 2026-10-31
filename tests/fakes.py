@@ -198,6 +198,9 @@ class FakeIt2:
     def list_sessions(self):
         return [dict(r) for r in self.rows]
 
+    def ping(self):
+        return getattr(self, "ping_rc", 0) == 0
+
     def get_var(self, guid, name):
         self.get_var_calls += 1
         return self.pane_of.get(guid, "") if name == "tmuxWindowPane" else ""

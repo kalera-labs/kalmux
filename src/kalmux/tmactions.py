@@ -306,7 +306,8 @@ def action_go(tmux: Tmux, it2: It2, tabmap: TabMap, session: str, env=None) -> R
     tabs = tabmap.refresh(force=True)
     if not tabs and tabmap.is_down():
         # an empty map because it2 failed is not "no tab": opening would stack a second -CC client on the session
-        return Result(False, f"iTerm2 is not answering (it2 failed); not opening another tab for {session}")
+        return Result(False, f"iTerm2 is not answering (it2 failed); not opening another tab for {session}. "
+                             f"If iTerm2 came back after a crash or a logout: kalmux ui restart, in an iTerm2 tab")
     with_tab = [p for p in panes if p["pane_id"] in tabs]
     if not with_tab:
         return action_open(tmux, it2, session)

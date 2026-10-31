@@ -376,6 +376,10 @@ class It2:
     def _run(self, *args: str) -> str:
         return self._run_rc(*args)[1]
 
+    def ping(self) -> bool:
+        """Does iTerm2 answer this process? One call, no JSON-to-text fallback."""
+        return self._run_rc("session", "list")[0] == 0
+
     def list_sessions(self) -> list[dict]:
         """iTerm2 sessions as dicts: guid, name, title, window, tab, tty, is_tmux (JSON with TSV fallback)."""
         raw = self._run("session", "list", "--json")

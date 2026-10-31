@@ -15,7 +15,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import tmconfig, tmhooks, tmrestore, tmsetup, tmstatusline
+from . import tmconfig, tmhooks, tmrestore, tmsession, tmsetup, tmstatusline
 from .tmactions import (
     TabMap,
     action_color,
@@ -302,10 +302,26 @@ def cmd_ui(args) -> int:
     return 2
 
 
+LEFT_OVER_TRIES = 5                    # it2 probes, 1 s apart, before a server of another session is left alone
+
+
+def _left_over(h: dict) -> bool:
+    """Is the running server stuck in an earlier login session while this process reaches iTerm2?"""
+    return tmsession.caller_left_over(h, It2, tries=LEFT_OVER_TRIES)
+
+
 def _ui_start() -> int:
-    if health(UI_PORT):
+    h = health(UI_PORT)
+    if h and not _left_over(h):
         print(f"kalmux ui: already running on {UI_URL}")
         return 0
+    if h:
+        # iTerm2's AutoLaunch lands here after a crash that logged the user out: the old server still answers
+        # but can no longer reach iTerm2 (see tmsession), so "already running" would leave the toolbelt dead
+        print(f"kalmux ui: the server on {UI_URL} (pid {h.get('pid')}) belongs to an earlier login session "
+              "and cannot reach iTerm2; replacing it")
+        if _ui_stop() != 0:
+            return 1
     # tmsetup.CLI, never this module's own path: the server is spawned as `python3 <script> ui serve`,
     # and cli.py is a package module — running it as a script dies on its relative imports.
     if tmsetup.start_server(tmsetup.CLI):
@@ -364,6 +380,10 @@ def _ui_stop(wait: float = 5.0) -> int:
     deadline = time.monotonic() + wait
     while time.monotonic() < deadline and health(UI_PORT):
         time.sleep(0.1)                        # so that `tm ui stop && tm ui start` does not race the old server
+    if health(UI_PORT):
+        # a restart would otherwise report "already running" and leave the old code (or session) in charge
+        print(f"kalmux ui: pid {pid} is still answering after {wait:g} s; not starting another", file=sys.stderr)
+        return 1
     _drop_pidfile()
     return 0
 
